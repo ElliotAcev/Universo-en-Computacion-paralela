@@ -1,0 +1,33 @@
+# --- Dependencias y toolchain (enormes, no van al repo) ---
+vcpkg/
+venv/
+.venv/
+
+# --- Binarios compilados ---
+*.exe
+*.exp
+*.lib
+*.dll
+*.obj
+*.pdb
+galaxy.*
+
+# --- Presentaciones HTML (no son código del proyecto) ---
+*.html
+
+# --- Documentos de contexto / instrucciones (se quedan locales) ---
+CONTEXTO_PROYECTO.md
+INSTRUCCIONES_PC1_MAESTRO.md
+INSTRUCCIONES_PC2_TRABAJADOR.md
+INSTRUCCIONES_PC3_TRABAJADOR.md
+INSTRUCCIONES_POR_PC.md
+
+# --- Basura de Python / editores ---
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+
+# --- Scratchpad / temporales ---
+scratchpad/
+*.log
