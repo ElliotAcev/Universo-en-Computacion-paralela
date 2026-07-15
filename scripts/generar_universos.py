@@ -25,7 +25,8 @@ import traceback
 import numpy as np
 from mpi4py import MPI
 
-from simular_universo import simular, contraste_densidad
+from simular_universo import simular, contraste_densidad, G, EPS2, BOX
+from compute import create_backend
 
 
 def repartir_semillas(total, size, pesos=None):
@@ -58,6 +59,9 @@ def main():
     ap.add_argument("--local", action="store_true",
                     help="cada PC guarda en su propio disco (por defecto: los datos se "
                          "envian al maestro por MPI)")
+    ap.add_argument("--backend", type=str, default="auto",
+                    help="auto | cpu | cuda | opencl. Con 'auto' cada PC detecta su GPU "
+                         "(NVIDIA->CUDA, AMD->OpenCL, si no CPU)")
     args = ap.parse_args()
 
     comm = MPI.COMM_WORLD
@@ -83,7 +87,20 @@ def main():
         os.makedirs(args.salida, exist_ok=True)
     comm.Barrier()
 
-    print(f"[rank {rank}@{host}] me tocan {len(mis_semillas)} universos", flush=True)
+    # cada PC elige su backend: PC1/PC2 (NVIDIA) -> CUDA, PC3 (AMD) -> OpenCL
+    backend = create_backend(args.backend, {"G": G, "EPS2": EPS2, "BOX": BOX})
+    print(f"[rank {rank}@{host}] backend: {backend.nombre} [{backend.dispositivo}] "
+          f"| me tocan {len(mis_semillas)} universos", flush=True)
+
+    # el maestro muestra que backend eligio cada PC
+    resumen_backends = comm.gather({"rank": rank, "host": host,
+                                    "backend": backend.nombre,
+                                    "dispositivo": backend.dispositivo}, root=0)
+    if rank == 0:
+        print("\n  Backend elegido por cada PC:")
+        for b in resumen_backends:
+            print(f"    rank {b['rank']} ({b['host']}): {b['backend']} -> {b['dispositivo']}")
+        print()
 
     # cada proceso simula sus universos, capturando errores para poder decir
     # DESPUES en que PC fallo y por que (si no, el fallo se pierde)
@@ -92,7 +109,7 @@ def main():
     mis_resultados = []
     for seed in mis_semillas:
         try:
-            res = simular(args.n, args.steps, seed)
+            res = simular(args.n, args.steps, seed, backend=backend)
             c = contraste_densidad(res["pos_final"])
             if args.local:
                 # modo antiguo: cada PC guarda en SU disco

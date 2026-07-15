@@ -129,21 +129,27 @@ def contraste_densidad(pos, celdas=8):
     return conteo.std() / conteo.mean()
 
 
-def simular(n, steps, seed, n_snapshots=0):
-    """Evoluciona el universo con integración leapfrog (KDK)."""
+def simular(n, steps, seed, n_snapshots=0, backend=None):
+    """Evoluciona el universo con integración leapfrog (KDK).
+
+    'backend' calcula la gravedad: CPU (NumPy), CUDA o OpenCL. Si es None se usa
+    la version NumPy de este modulo (para que el script siga funcionando solo).
+    """
     pos, vel, masa, n = condiciones_iniciales(n, seed)
     pos_inicial = pos.copy()
+
+    calc_acc = backend.aceleraciones if backend is not None else aceleraciones
 
     guardar_cada = max(1, steps // n_snapshots) if n_snapshots > 0 else 0
     snapshots = []
 
     t0 = time.perf_counter()
-    acc = aceleraciones(pos, masa)
+    acc = calc_acc(pos, masa)
     for paso in range(steps):
         vel += 0.5 * DT * acc          # medio empujón
         pos += DT * vel                # mover
         pos %= BOX                     # envolver en la caja periódica
-        acc = aceleraciones(pos, masa)
+        acc = calc_acc(pos, masa)
         vel += 0.5 * DT * acc          # otro medio empujón
         if guardar_cada and paso % guardar_cada == 0:
             snapshots.append(pos.copy())
