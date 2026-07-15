@@ -28,6 +28,11 @@ __pycache__/
 .vscode/
 .idea/
 
+# --- Datos generados por la simulacion (se regeneran con los scripts) ---
+dataset/
+*.npz
+*.pt
+
 # --- Scratchpad / temporales ---
 scratchpad/
 *.log
