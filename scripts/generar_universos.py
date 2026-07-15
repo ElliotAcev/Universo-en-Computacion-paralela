@@ -21,6 +21,7 @@ Salida:
 import argparse
 import os
 import time
+import traceback
 import numpy as np
 from mpi4py import MPI
 
@@ -81,19 +82,48 @@ def main():
 
     print(f"[rank {rank}@{host}] me tocan {len(mis_semillas)} universos", flush=True)
 
-    # cada proceso simula sus universos
+    # cada proceso simula sus universos, capturando errores para poder decir
+    # DESPUES en que PC fallo y por que (si no, el fallo se pierde)
     t0 = time.perf_counter()
+    errores = []
     for seed in mis_semillas:
-        res = simular(args.n, args.steps, seed)
-        ruta = os.path.join(args.salida, f"universo_seed{seed:02d}.npz")
-        np.savez_compressed(ruta, **res)
-        c = contraste_densidad(res["pos_final"])
-        print(f"[rank {rank}] seed={seed:02d} listo  ({res['tiempo_s']:.1f}s, contraste={c:.2f})", flush=True)
+        try:
+            res = simular(args.n, args.steps, seed)
+            ruta = os.path.join(args.salida, f"universo_seed{seed:02d}.npz")
+            np.savez_compressed(ruta, **res)
+            c = contraste_densidad(res["pos_final"])
+            print(f"[rank {rank}] seed={seed:02d} listo  ({res['tiempo_s']:.1f}s, contraste={c:.2f})", flush=True)
+        except Exception as e:
+            errores.append({
+                "seed": seed,
+                "tipo": type(e).__name__,
+                "mensaje": str(e),
+                "traza": traceback.format_exc(),
+            })
+            print(f"[rank {rank}] ERROR en seed={seed:02d}: {type(e).__name__}: {e}", flush=True)
     mi_tiempo = time.perf_counter() - t0
 
-    # el maestro recoge los tiempos de cada rank (dato para el balanceo)
+    # el maestro recoge tiempos y errores de cada rank
     tiempos = comm.gather(mi_tiempo, root=0)
+    todos_errores = comm.gather({"rank": rank, "host": host, "errores": errores}, root=0)
     comm.Barrier()
+
+    # informe de errores: quien fallo y por que
+    if rank == 0:
+        con_fallas = [x for x in todos_errores if x["errores"]]
+        if con_fallas:
+            print("\n" + "!" * 60)
+            print("  SE PRODUJERON ERRORES — detalle por PC")
+            print("!" * 60)
+            for x in con_fallas:
+                print(f"\n  rank {x['rank']} (host '{x['host']}') fallo en {len(x['errores'])} universo(s):")
+                for e in x["errores"]:
+                    print(f"    - seed {e['seed']:02d}: {e['tipo']}: {e['mensaje']}")
+            print("\n  (traza completa del primer error:)")
+            print(con_fallas[0]["errores"][0]["traza"])
+            print("!" * 60)
+        else:
+            print("\n  Sin errores: los", size, "procesos completaron su trabajo.")
     if rank == 0:
         print("\n=== Resumen de la generacion distribuida ===")
         for r, t in enumerate(tiempos):
