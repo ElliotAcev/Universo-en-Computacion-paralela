@@ -55,6 +55,9 @@ def main():
     ap.add_argument("--steps", type=int, default=200, help="pasos de simulación")
     ap.add_argument("--salida", type=str, default="dataset", help="carpeta de salida")
     ap.add_argument("--pesos", type=str, default="", help="pesos por rank separados por coma, ej: 1.0,0.6,0.4")
+    ap.add_argument("--local", action="store_true",
+                    help="cada PC guarda en su propio disco (por defecto: los datos se "
+                         "envian al maestro por MPI)")
     args = ap.parse_args()
 
     comm = MPI.COMM_WORLD
@@ -86,12 +89,26 @@ def main():
     # DESPUES en que PC fallo y por que (si no, el fallo se pierde)
     t0 = time.perf_counter()
     errores = []
+    mis_resultados = []
     for seed in mis_semillas:
         try:
             res = simular(args.n, args.steps, seed)
-            ruta = os.path.join(args.salida, f"universo_seed{seed:02d}.npz")
-            np.savez_compressed(ruta, **res)
             c = contraste_densidad(res["pos_final"])
+            if args.local:
+                # modo antiguo: cada PC guarda en SU disco
+                ruta = os.path.join(args.salida, f"universo_seed{seed:02d}.npz")
+                np.savez_compressed(ruta, **res)
+            else:
+                # modo por defecto: guardamos para enviarselo al maestro por MPI.
+                # Usamos float32 para que viaje la mitad de datos por la red.
+                mis_resultados.append({
+                    "seed": seed,
+                    "pos_inicial": res["pos_inicial"].astype(np.float32),
+                    "pos_final": res["pos_final"].astype(np.float32),
+                    "tiempo_s": res["tiempo_s"],
+                    "n": res["n"],
+                    "steps": res["steps"],
+                })
             print(f"[rank {rank}] seed={seed:02d} listo  ({res['tiempo_s']:.1f}s, contraste={c:.2f})", flush=True)
         except Exception as e:
             errores.append({
@@ -106,6 +123,22 @@ def main():
     # el maestro recoge tiempos y errores de cada rank
     tiempos = comm.gather(mi_tiempo, root=0)
     todos_errores = comm.gather({"rank": rank, "host": host, "errores": errores}, root=0)
+
+    # RECOGIDA DE DATOS: cada trabajador manda sus universos al maestro por MPI,
+    # asi los .npz terminan todos en el PC del maestro (que entrena el surrogate)
+    if not args.local:
+        t_env = time.perf_counter()
+        recogidos = comm.gather(mis_resultados, root=0)
+        if rank == 0:
+            guardados = 0
+            for lote in recogidos:
+                for r in lote:
+                    ruta = os.path.join(args.salida, f"universo_seed{r['seed']:02d}.npz")
+                    np.savez_compressed(ruta, **{k: v for k, v in r.items() if k != "seed"})
+                    guardados += 1
+            mb = sum(len(l) for l in recogidos) * args.n * 3 * 4 * 2 / 1e6
+            print(f"\n  Datos recogidos por MPI: {guardados} universos "
+                  f"(~{mb:.1f} MB) en {time.perf_counter()-t_env:.1f}s -> {args.salida}/")
     comm.Barrier()
 
     # informe de errores: quien fallo y por que
