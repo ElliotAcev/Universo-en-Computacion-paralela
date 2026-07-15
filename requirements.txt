@@ -1,0 +1,17 @@
+# Dependencias base (todos los PCs del cluster)
+#   pip install -r requirements.txt
+numpy
+mpi4py
+matplotlib
+
+# --- Aceleracion por GPU (segun el hardware de cada PC) ---
+# NO se instalan desde aqui: cada uno necesita su propio comando.
+#
+# GPU NVIDIA (CUDA) -- PC1 (RTX 4060), PC2 (RTX 3050):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+# GPU AMD (OpenCL) -- PC3 (Radeon RX):
+#   pip install pyopencl
+#   (requiere los drivers AMD Adrenalin, que traen el runtime OpenCL)
+#
+# Sin GPU: no instales nada mas. El backend CPU (NumPy) siempre funciona.
