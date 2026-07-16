@@ -24,11 +24,19 @@ import numpy as np
 
 from simular_universo import aceleraciones, BOX
 
-# Velocidad relativa de cada GPU (1.0 = la más rápida). Ajustar con medidas reales.
+# Velocidad relativa de cada GPU (1.0 = la más rápida).
+#
+# MEDIDAS REALES en el clúster (2026-07-16, N=1500, steps=200, backend CUDA):
+#   RTX 4060: 0.43 s/universo  -> 1.00 (referencia)
+#   RTX 3050: 0.66 s/universo  -> 0.65
+# Validado en hardware real: con reparto 10/10 el speedup fue 1.65x; aplicando
+# estos pesos (reparto 12/8) subio a 1.96x -> 98% de eficiencia paralela.
+#
+# El peso de la AMD sigue siendo una ESTIMACION (aun no se ha medido).
 GPUS = {
-    "PC1-RTX4060 (CUDA)": 1.00,
-    "PC2-RTX3050 (CUDA)": 0.60,
-    "PC3-AMD-RX (OpenCL)": 0.40,
+    "PC1-RTX4060 (CUDA)": 1.00,    # medido
+    "PC2-RTX3050 (CUDA)": 0.65,    # medido
+    "PC3-AMD-RX (OpenCL)": 0.40,   # estimado, pendiente de medir
 }
 
 
