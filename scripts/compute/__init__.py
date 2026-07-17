@@ -18,7 +18,7 @@ Uso:
     acc = backend.aceleraciones(pos, masa)
 """
 
-import warnings
+# (sin warnings: la deteccion informa con print, ver create_backend)
 
 
 def _probar_cuda(config):
@@ -56,9 +56,17 @@ def create_backend(backend_name="auto", config=None):
         raise ValueError(f"backend desconocido: {backend_name!r} (usa auto/cpu/cuda/opencl)")
 
     # --- auto-deteccion ---
+    # Que un backend falle aqui es NORMAL, no un error: un PC con GPU AMD nunca
+    # tendra CUDA, y debe pasar a OpenCL. Por eso se informa en vez de avisar
+    # con warnings (que en pantalla parecen fallos).
     for intento, fabrica in (("CUDA", _probar_cuda), ("OpenCL", _probar_opencl)):
         try:
             return fabrica(config)
+        except ImportError:
+            print(f"  [info] {intento} no instalado en este PC -> probando el siguiente", flush=True)
         except Exception as e:
-            warnings.warn(f"{intento} no disponible aqui ({type(e).__name__}: {e}); probando el siguiente")
+            # Esto si merece atencion: la libreria esta pero el dispositivo falla
+            print(f"  [aviso] {intento} instalado pero no utilizable ({type(e).__name__}: {e})",
+                  flush=True)
+    print("  [info] sin GPU utilizable -> se usara la CPU (mas lento)", flush=True)
     return _cpu(config)
