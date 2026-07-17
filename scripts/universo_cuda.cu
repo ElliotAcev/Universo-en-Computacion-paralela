@@ -29,6 +29,17 @@
 #define G               0.00015f    // constante gravitacional escalada
 #define EPSILON2        0.08f       // suavizador (evita singularidades)
 #define DT              0.004f      // paso de tiempo
+// Radio visual del agujero negro, en unidades del mundo (la galaxia mide ~22).
+// Semi-tamano del QUAD del agujero negro, en unidades del mundo. Ojo: no es el
+// tamano del agujero: el fenomeno (sombra + disco + arcos lenteados) ocupa solo
+// el ~45% central. El resto es margen para que los arcos no los corte el borde
+// del quad (se veia el filo recto del cuadrado).
+//
+// Escala: la galaxia tiene radio ~22. Con 3.2 de quad, el fenomeno visible
+// (sombra + disco) mide ~2.6 de diametro: un nucleo galactico creible. Un
+// agujero negro supermasivo REAL es millones de veces mas pequeno que su
+// galaxia (seria invisible), asi que esto ya es una licencia generosa.
+#define RADIO_BH        3.2f
 #define MASS_CENTRAL    50000.0f    // masa del agujero negro central (dominante: ancla el centro)
 #define NUM_ARMS        2           // brazos espirales
 
@@ -39,7 +50,7 @@
 // Espera tras aterrizar en el halo antes de que la galaxia se forme sola.
 #define SEG_ESPERA_HALO  2.5f
 // Cuanto tarda el halo en reorganizarse en galaxia (transicion suave).
-#define SEG_MORPH        7.0f
+#define SEG_MORPH       12.0f
 
 // ─── Modo UNIVERSO (cosmologico) ───────────────────────────────────────────
 // La caja donde vive el universo. Debe coincidir con --escala de exportar_ci.py
@@ -231,6 +242,12 @@ __global__ void kernelLeapfrog(Body* __restrict__ pos,
     // (asi siempre queda en el centro visual del bulbo, sin derivar).
     if (pos[i].w > 500.0f) return;
 
+    // Masa ~0 = telarana cosmica congelada (decorado) o estrella ya absorbida.
+    // Ponerles masa 0 evita que EJERZAN gravedad, pero seguian RECIBIENDOLA:
+    // eran particulas de prueba cayendo hacia el agujero negro hasta que se
+    // las tragaba. El fondo debe quedarse quieto.
+    if (pos[i].w < 1e-6f) return;
+
     // Actualiza velocidad (medio paso adelante)
     float vx = vel[i].x + acc[i].x * dt;
     float vy = vel[i].y + acc[i].y * dt;
@@ -264,37 +281,12 @@ __global__ void kernelLeapfrog(Body* __restrict__ pos,
  *
  * com[0..2] = sum(m*pos),  com[3] = sum(m)   (solo estrellas, no el agujero)
  */
-__global__ void kernelAcumCoM(const Body* __restrict__ pos, int N, float* com, int bh)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
-    float m = pos[i].w;
-    if (m > 500.0f) return;                 // excluye el agujero negro
-
-    // Solo cuenta las estrellas CERCANAS al agujero (el bulbo), no todo el
-    // disco: asi el agujero queda en el centro del bulbo brillante y no en el
-    // centro de masa global (que un disco asimetrico desplazaria).
-    float dx = pos[i].x - pos[bh].x;
-    float dy = pos[i].y - pos[bh].y;
-    float dz = pos[i].z - pos[bh].z;
-    if (dx*dx + dy*dy + dz*dz > 16.0f) return;   // radio ~4 (nucleo del bulbo)
-
-    atomicAdd(&com[0], m * pos[i].x);
-    atomicAdd(&com[1], m * pos[i].y);
-    atomicAdd(&com[2], m * pos[i].z);
-    atomicAdd(&com[3], m);
-}
-
 /*
  * ─── BUSCADOR DE HALOS (modo universo) ─────────────────────────────────────
  *
  * Localiza el nodo mas denso de la telarana cosmica: el sitio donde nacera la
  * galaxia. Es un FoF ("friends of friends") casero por rejilla, la version
  * simple de lo que hacen Rockstar o AHF.
- *
- * Paso 1: contar cuantas particulas caen en cada celda de una rejilla HALO_GRID^3
- * Paso 2 (host): elegir la celda con mas particulas
- * Paso 3: centro de masa de las particulas de esa celda -> el centro del halo
  */
 #define HALO_GRID   16      // resolucion de la rejilla del buscador
 
@@ -314,7 +306,6 @@ __global__ void kernelContarCeldas(const Body* __restrict__ pos, int N, int* con
 }
 
 // Centro de masa de las particulas que caen dentro de la celda elegida.
-// com[0..2] = suma de posiciones, com[3] = cuantas particulas.
 __global__ void kernelCoMCelda(const Body* __restrict__ pos, int N,
                                int cx, int cy, int cz, float* com)
 {
@@ -332,14 +323,62 @@ __global__ void kernelCoMCelda(const Body* __restrict__ pos, int N,
     atomicAdd(&com[3], 1.0f);
 }
 
+/*
+ * Centro de masa de la GALAXIA ENTERA (no de lo que rodea al agujero negro).
+ *
+ * Antes solo contaba las estrellas a menos de 4 del agujero. Eso creaba un
+ * bucle de realimentacion: si el agujero se desviaba un poco, su zona de
+ * busqueda se iba con el, media el centro de masa de estrellas cada vez mas
+ * descentradas, y se desviaba mas... hasta escaparse. Con 350k estrellas el
+ * bulbo era tan denso que lo anclaba; con 27k (la galaxia que nace de un halo)
+ * el ruido bastaba para disparar el bucle.
+ *
+ * Ahora se promedia toda la galaxia: un centro que NO depende de donde este el
+ * agujero, asi que no hay realimentacion posible.
+ *
+ * com[0..2] = suma(m*pos),  com[3] = suma(m)
+ */
+__global__ void kernelAcumCoM(const Body* __restrict__ pos, int N, float* com,
+                              int bh, const int* __restrict__ slot)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N || i == bh) return;
+
+    // Solo cuenta la galaxia: la telarana cosmica (slot < 0) es decorado.
+    if (slot != NULL && slot[i] < 0) return;
+
+    float m = pos[i].w;
+    if (m > 500.0f) return;      // otro cuerpo masivo (no deberia haber)
+    if (m <= 0.0f) return;       // absorbida por el agujero: ya no cuenta
+
+    atomicAdd(&com[0], m * pos[i].x);
+    atomicAdd(&com[1], m * pos[i].y);
+    atomicAdd(&com[2], m * pos[i].z);
+    atomicAdd(&com[3], m);
+}
+
 // Coloca el agujero negro (cuerpo 0) en el centro de masa de las estrellas.
 __global__ void kernelFijarBHalCoM(Body* __restrict__ pos, const float* com, int bh)
 {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        float invM = (com[3] > 0.0f) ? 1.0f / com[3] : 0.0f;
-        pos[bh].x = com[0] * invM;
-        pos[bh].y = com[1] * invM;
-        pos[bh].z = com[2] * invM;
+        // Si no hay estrellas cerca, NO tocar el agujero: antes se hacia
+        // pos[bh] = com*0 = (0,0,0) y el agujero se teletransportaba a la
+        // esquina del mundo.
+        if (com[3] <= 0.0f) return;
+
+        float invM = 1.0f / com[3];
+        float cx = com[0] * invM;
+        float cy = com[1] * invM;
+        float cz = com[2] * invM;
+
+        // SEGUIMIENTO SUAVE, no salto instantaneo.
+        // El centro de masa medido tiene ruido estadistico ~1/sqrt(n_estrellas):
+        // con 350k estrellas apenas se nota, pero con 27k (la galaxia que nace
+        // de un halo) el agujero temblaba persiguiendo ese ruido. Filtramos.
+        const float k = 0.06f;   // 0 = inmovil, 1 = salta al instante
+        pos[bh].x += (cx - pos[bh].x) * k;
+        pos[bh].y += (cy - pos[bh].y) * k;
+        pos[bh].z += (cz - pos[bh].z) * k;
     }
 }
 
@@ -373,13 +412,12 @@ __global__ void kernelMarcarHalo(const Body* __restrict__ pos, int N,
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
+    // Distancia DIRECTA, sin imagen minima. Si usaramos la imagen periodica,
+    // la materia del borde opuesto entraria en la galaxia y tendria que cruzar
+    // todo el universo (o teletransportarse) para llegar: un salto visual
+    // enorme. Por eso buscarHalo() prefiere halos centrados, donde la esfera
+    // cabe entera sin tocar las fronteras.
     float dx = pos[i].x - cx, dy = pos[i].y - cy, dz = pos[i].z - cz;
-    // IMAGEN MINIMA: si el halo cae cerca de un borde, su esfera se sale de la
-    // caja. Como las fronteras son periodicas, la materia del lado opuesto
-    // TAMBIEN es su vecina. Sin esto el halo perdia media galaxia.
-    dx -= UNIVERSE_BOX * rintf(dx * INV_UNIVERSE_BOX);
-    dy -= UNIVERSE_BOX * rintf(dy * INV_UNIVERSE_BOX);
-    dz -= UNIVERSE_BOX * rintf(dz * INV_UNIVERSE_BOX);
     if (dx*dx + dy*dy + dz*dz <= RADIO_HALO * RADIO_HALO) {
         int k = atomicAdd(contador, 1);
         slot[i] = k;
@@ -391,6 +429,77 @@ __global__ void kernelMarcarHalo(const Body* __restrict__ pos, int N,
     } else {
         slot[i] = -1;   // fuera del halo: sigue siendo telarana cosmica
     }
+}
+
+/*
+ * Al terminar el morph, cada particula de la galaxia necesita SU velocidad
+ * orbital (la que calculo initGalaxy), no la que traia del universo.
+ *
+ * Sin esto la galaxia no rota: las estrellas conservan las velocidades
+ * aleatorias del Big Bang, el disco se deshace, el bulbo deriva... y como el
+ * agujero negro se coloca en el centro de masa del bulbo, se va con el.
+ *
+ * La materia de fuera del halo (slot < 0) conserva su velocidad: sigue siendo
+ * telarana cosmica y debe seguir su curso.
+ */
+/*
+ * El agujero negro DESTRUYE lo que se le acerca demasiado (disrupcion de marea).
+ *
+ * Sin esto las estrellas atraviesan el centro y salen por el otro lado: el
+ * suavizado del kernel de fuerzas (EPSILON2) evita la singularidad, pero
+ * tambien deja pasar de largo.
+ *
+ * El radio no es el del horizonte sino el del DISCO DE ACRECION: una estrella
+ * que se acerca tanto la despedazan las fuerzas de marea mucho antes de cruzar
+ * el horizonte. Ademas, asi coincide con lo que se VE: ninguna estrella cruza
+ * el disco brillante.
+ *
+ * Una estrella absorbida se esconde en el centro con masa 0: deja de tirar de
+ * las demas (ya es parte del agujero) y queda invisible dentro de la sombra.
+ */
+__global__ void kernelAbsorber(Body* __restrict__ pos, Body* __restrict__ vel,
+                               int N, int bh, float rHorizonte)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N || i == bh) return;
+    if (pos[i].w > 500.0f) return;      // el propio agujero negro
+    if (pos[i].w < 1e-6f) return;       // telarana congelada o ya absorbida
+
+    float dx = pos[i].x - pos[bh].x;
+    float dy = pos[i].y - pos[bh].y;
+    float dz = pos[i].z - pos[bh].z;
+    if (dx*dx + dy*dy + dz*dz < rHorizonte * rHorizonte) {
+        pos[i] = make_float4(pos[bh].x, pos[bh].y, pos[bh].z, 0.0f);
+        vel[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+}
+
+__global__ void kernelAsignarVelGalaxia(Body* __restrict__ pos,
+                                        Body* __restrict__ vel,
+                                        const Body* __restrict__ velGal,
+                                        const int* __restrict__ slot,
+                                        int N, int nGal)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    int k = slot[i];
+
+    if (k >= 0 && k < nGal) {
+        vel[i] = velGal[k];              // la galaxia recibe sus velocidades orbitales
+        return;
+    }
+
+    // ── La telarana pasa a ser DECORADO DE FONDO ──
+    // Sus particulas pesan 1.0 (unidades del universo) mientras las estrellas de
+    // la galaxia pesan ~0.001-0.006 (unidades de initGalaxy): son ~300x mas
+    // pesadas, y quedan 37000 alrededor -> su masa total (~37000) compite con
+    // la del agujero negro (50000). Tiraban de la galaxia, la deformaban y
+    // arrastraban el bulbo... y el agujero negro, que se coloca en el centro de
+    // masa del bulbo, se iba con el.
+    // Solucion: masa despreciable (no ejercen gravedad) y quietas. Siguen
+    // viendose (kernelCopiaVBO les da su propio tamano de render).
+    pos[i].w = 1e-9f;
+    vel[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 }
 
 __global__ void kernelMorph(Body* __restrict__ pos,
@@ -406,14 +515,23 @@ __global__ void kernelMorph(Body* __restrict__ pos,
     if (k < 0 || k >= nGal) return;    // materia fuera del halo: NO se toca,
                                        // sigue formando la telarana cosmica
 
-    // Desenvolvemos la particula a su imagen periodica mas cercana al halo. Si
-    // no, una particula del borde opuesto cruzaria TODA la caja para llegar a
-    // la galaxia, dejando un rastro absurdo de un lado al otro del universo.
-    float dx = origen[i].x - cx, dy = origen[i].y - cy, dz = origen[i].z - cz;
-    dx -= UNIVERSE_BOX * rintf(dx * INV_UNIVERSE_BOX);
-    dy -= UNIVERSE_BOX * rintf(dy * INV_UNIVERSE_BOX);
-    dz -= UNIVERSE_BOX * rintf(dz * INV_UNIVERSE_BOX);
-    float ox = cx + dx, oy = cy + dy, oz = cz + dz;   // origen ya desenvuelto
+    // ── El agujero negro NO viaja ──
+    // El hueco 0 (que initGalaxy reserva para el agujero) se lo lleva una
+    // particula cualquiera, y si le tocaba una del borde del halo tenia que
+    // cruzar toda la galaxia... con retardo por distancia. Resultado: llegaba
+    // TARDE y desde un lado, aterrizando en una galaxia ya formada.
+    // Ahora nace directamente en el centro del halo. El salto no se ve porque
+    // arranca con un 8% de su tamano (uCrecer) y va creciendo ahi mismo.
+    if (k == 0) {
+        pos[i] = destino[0];
+        return;
+    }
+
+    // Sin imagen minima: la particula viaja desde donde esta, en linea recta.
+    // (kernelMarcarHalo ya se aseguro de que solo entren las que estan cerca
+    //  de verdad, sin cruzar fronteras.)
+    float ox = origen[i].x, oy = origen[i].y, oz = origen[i].z;
+    float dx = ox - cx, dy = oy - cy, dz = oz - cz;
 
     // Retardo por distancia al centro del halo: el colapso ocurre de dentro
     // hacia fuera, como en un colapso gravitacional real.
@@ -438,15 +556,46 @@ __global__ void kernelMorph(Body* __restrict__ pos,
  */
 __global__ void kernelCopiaVBO(const Body* __restrict__ pos,
                                 float*      __restrict__ devVBO,
-                                int N)
+                                int N,
+                                const int* __restrict__ slot,
+                                float atenuacionWeb)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-    // VBO layout: x,y,z,speed (speed = longitud de velocidad, para colorear)
+    // VBO layout: x,y,z,masa (la masa manda el tamaño/brillo del punto)
     devVBO[i*4+0] = pos[i].x;
     devVBO[i*4+1] = pos[i].y;
     devVBO[i*4+2] = pos[i].z;
-    devVBO[i*4+3] = pos[i].w;  // masa → usada para tamaño del punto
+
+    // La telarana pasa a segundo plano al formarse la galaxia: si no, sus
+    // estrellas se pierden entre los miles de puntos del cubo (se ven iguales).
+    //
+    // Su tamano de render NO puede salir de la masa: al formarse la galaxia le
+    // ponemos masa ~0 para que no ejerza gravedad (competia con el agujero
+    // negro). Asi que aqui le damos un tamano propio, independiente de la
+    // fisica: separamos "cuanto pesa" de "como se ve".
+    float m = pos[i].w;
+    bool esTelarana = (slot == NULL) || (slot[i] < 0);
+
+    if (esTelarana) {
+        // NUBES COSMICAS: buena parte de la telarana se dibuja como "neblina"
+        // (el shader la pinta grande y muy tenue). Al solaparse muchas forman
+        // luz continua: los filamentos dejan de ser puntos sueltos y pasan a
+        // ser gas difuso, como en las visualizaciones cosmologicas reales.
+        //
+        // El marcador es la masa < 0.001, que activa esa rama del shader.
+        // Es SOLO render: la fisica no lo ve (la telarana esta congelada).
+        //
+        // 45% neblina + 20% gas + 35% punto: las tres capas juntas dan
+        // profundidad (nucleos brillantes sobre un halo difuso).
+        int cara = i & 19;
+        if      (cara < 9)  m = 0.00055f;              // 45% -> nube difusa grande
+        else if (cara < 13) m = 0.005f;                // 20% -> nube media
+        else                m = 0.85f * atenuacionWeb; // 35% -> punto nitido
+    }
+    else if (m <= 0.0f) m = -1.0f;    // absorbida por el agujero: no dibujar
+
+    devVBO[i*4+3] = m;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -499,11 +648,35 @@ int buscarHalo(const Body* dPos, int N, float* cx, float* cy, float* cz)
     kernelContarCeldas<<<grid, TILE_SIZE>>>(dPos, N, dConteo);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // El host elige la celda mas poblada (NC es pequeno: 4096 enteros)
+    // El host elige la celda mas poblada (NC es pequeno: 4096 enteros).
+    //
+    // PERO no vale cualquiera: si el halo cae pegado a un borde, su esfera de
+    // radio RADIO_HALO se sale de la caja y la galaxia nacería mutilada (falta
+    // la materia del otro lado, que no podemos traer sin teletransportarla a
+    // traves del universo). Por eso puntuamos cada celda con la poblacion
+    // PENALIZADA por lo cerca que esta del borde: preferimos un halo algo menos
+    // denso pero bien centrado.
     int* hConteo = (int*)malloc(NC * sizeof(int));
     CUDA_CHECK(cudaMemcpy(hConteo, dConteo, NC * sizeof(int), cudaMemcpyDeviceToHost));
+
     int mejor = 0;
-    for (int k = 1; k < NC; k++) if (hConteo[k] > hConteo[mejor]) mejor = k;
+    float mejorPuntos = -1.0f;
+    for (int k = 0; k < NC; k++) {
+        int kz = k % HALO_GRID;
+        int ky = (k / HALO_GRID) % HALO_GRID;
+        int kx = k / (HALO_GRID * HALO_GRID);
+        // centro de la celda en coordenadas del mundo
+        float px = (kx + 0.5f) / HALO_GRID * UNIVERSE_BOX;
+        float py = (ky + 0.5f) / HALO_GRID * UNIVERSE_BOX;
+        float pz = (kz + 0.5f) / HALO_GRID * UNIVERSE_BOX;
+        // margen hasta el borde mas cercano en los 3 ejes
+        float m = fminf(fminf(fminf(px, UNIVERSE_BOX - px), fminf(py, UNIVERSE_BOX - py)),
+                        fminf(pz, UNIVERSE_BOX - pz));
+        // 1.0 si la esfera cabe entera; baja hasta 0.15 pegado al borde
+        float encaje = fminf(1.0f, m / RADIO_HALO);
+        float puntos = hConteo[k] * (0.15f + 0.85f * encaje);
+        if (puntos > mejorPuntos) { mejorPuntos = puntos; mejor = k; }
+    }
     int poblacion = hConteo[mejor];
     free(hConteo);
 
@@ -678,26 +851,67 @@ void initGalaxy(Body* hPos, Body* hVel, int N)
         else if (isGas)  mass = 0.002f + randf() * 0.004f;
         else             mass = 0.02f + powf(randf(), 4.0f) * 0.9f;
 
-        // Velocidad circular kepleriana: v_c = sqrt(G*M_enc / r)
-        // Masa encerrada aproximada segun el RADIO real (no el indice del
-        // arreglo): al generar r = sqrt(rand())*22, la fraccion de masa del
-        // disco encerrada dentro de r es ~ (r/22)^2. Usar el indice en vez
-        // del radio real desincroniza la velocidad orbital de cada estrella
-        // y hace que la galaxia se colapse lentamente hacia el centro.
-        float fracEnc = fminf(1.0f, (r / 22.0f) * (r / 22.0f));
-        float Menc    = MASS_CENTRAL + (float)(N - 1) * 0.15f * fracEnc;
-        float vc      = sqrtf(G * Menc / r) * 0.92f;
-
-        // Perturbaciones termicas pequenas
-        float dvx = (randf() - 0.5f) * 0.012f;
-        float dvy = (randf() - 0.5f) * 0.005f;
-        float dvz = (randf() - 0.5f) * 0.012f;
-
+        // Solo guardamos posicion y masa. La velocidad NO se puede calcular
+        // todavia: necesita saber cuanta masa hay dentro del radio de cada
+        // estrella, y eso solo se sabe cuando estan todas generadas.
         hPos[i] = make_float4(x, y, z, mass);
-        hVel[i] = make_float4(-sinf(angle)*vc + dvx,
-                               dvy,
-                               cosf(angle)*vc + dvz,
-                               0.0f);
+        hVel[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    // ─── Velocidades orbitales a partir de la masa encerrada REAL ──────────
+    //
+    // Antes esto se estimaba con  Menc = MASS_CENTRAL + (N-1)*0.15*(r/22)^2,
+    // dando por hecho que cada estrella pesa 0.15. La masa media real es 0.121
+    // (medido): la formula inflaba la masa del disco un 24%. Con N grande el
+    // error se disimulaba con un factor 0.92 puesto a ojo, pero con N pequeno
+    // (p.ej. la galaxia que nace de un halo) el disco pesa poco, el 0.92 ya no
+    // compensa nada y deja las estrellas ~8% lentas: la galaxia se deshace.
+    //
+    // Ahora se SUMAN las masas de verdad: ordenamos por radio y acumulamos.
+    // Sin constantes magicas y correcto para cualquier N.
+    {
+        int  n = N - 1;                       // sin contar el agujero negro
+        int* orden = (int*)malloc(n * sizeof(int));
+        float* radio = (float*)malloc(n * sizeof(float));
+        for (int i = 0; i < n; i++) {
+            const Body& p = hPos[i + 1];
+            radio[i] = sqrtf(p.x*p.x + p.z*p.z);   // radio cilindrico (disco en XZ)
+            orden[i] = i;
+        }
+        // ordenar indices por radio (insertion sort seria O(n^2): usamos qsort)
+        static float* radioOrden;              // el comparador necesita verlo
+        radioOrden = radio;
+        qsort(orden, n, sizeof(int), [](const void* a, const void* b) {
+            float ra = radioOrden[*(const int*)a];
+            float rb = radioOrden[*(const int*)b];
+            return (ra < rb) ? -1 : (ra > rb) ? 1 : 0;
+        });
+
+        // Masa acumulada: recorriendo de dentro hacia fuera
+        float acumulada = MASS_CENTRAL;        // el agujero negro esta en el centro
+        for (int k = 0; k < n; k++) {
+            int i = orden[k];
+            float r = fmaxf(radio[i], 0.05f);
+            // La masa de esta estrella no se atrae a si misma: se suma DESPUES
+            float Menc = acumulada;
+            acumulada += hPos[i + 1].w;
+
+            float vc = sqrtf(G * Menc / r);    // velocidad circular exacta
+            float angle = atan2f(hPos[i + 1].z, hPos[i + 1].x);
+
+            // Perturbaciones termicas pequenas
+            float dvx = (randf() - 0.5f) * 0.012f;
+            float dvy = (randf() - 0.5f) * 0.005f;
+            float dvz = (randf() - 0.5f) * 0.012f;
+
+            hVel[i + 1] = make_float4(-sinf(angle)*vc + dvx,
+                                       dvy,
+                                       cosf(angle)*vc + dvz,
+                                       0.0f);
+        }
+        printf("Galaxia: %d estrellas, masa estelar total %.0f (agujero negro %.0f)\n",
+               n, acumulada - MASS_CENTRAL, (float)MASS_CENTRAL);
+        free(orden); free(radio);
     }
 
     // Anular el momento lineal neto de las ESTRELLAS (sin tocar el agujero
@@ -746,6 +960,11 @@ float hash(int i) {
 
 void main() {
     gl_Position  = uMVP * vec4(inPos, 1.0);
+
+    // masa negativa = particula ABSORBIDA por el agujero negro. La marca la
+    // pone kernelCopiaVBO; aqui simplemente no se dibuja.
+    if (inMass < 0.0) { gl_PointSize = 0.0; gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+
     bool  isHaze = inMass < 0.001;   // neblina de relleno (resplandor continuo)
     bool  isGas  = inMass < 0.008 && !isHaze;   // gas/polvo coloreado
     float jitter = mix(0.7, 1.3, hash(gl_VertexID * 7 + 3));  // variedad extra entre estrellas similares
@@ -878,40 +1097,157 @@ void main() {
 // A diferencia de las estrellas (aditivo), esta pasada usa alpha normal, asi
 // el horizonte de eventos se dibuja negro OPACO y realmente tapa las estrellas
 // de atras -> se ve como un agujero negro real, no un hueco en las particulas.
+// ═══════════════════════════════════════════════════════════════════════════
+//  AGUJERO NEGRO estilo GARGANTUA — con trazado de rayos relativista
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// La version anterior era una composicion 2D (un circulo negro con bandas
+// pintadas encima) y por eso parecia una calcomania. Gargantua se ve
+// tridimensional porque la luz SE CURVA de verdad alrededor de la esfera: ves
+// el disco rodearla por detras, subir por encima y volver por debajo.
+//
+// Aqui cada pixel lanza un rayo desde la camara y lo INTEGRA paso a paso bajo
+// la gravedad del agujero:
+//   - si el rayo cae dentro del horizonte  -> negro (la sombra)
+//   - si cruza el plano del disco          -> recoge su luz
+//   - si escapa                            -> se va al fondo
+// Como los rayos se curvan, el disco de detras aparece por arriba y por abajo:
+// eso es la lente gravitacional, y sale sola de la integracion.
 static const char* BH_VS_SOURCE = R"glsl(
 #version 330 core
-layout(location = 0) in vec3 inPos;
-layout(location = 1) in float inMass;
-uniform mat4 uMVP;
+layout(location = 0) in vec2 inCorner;   // esquina del quad, en [-1,1]
+uniform mat4  uMVP;
+uniform vec3  uCentro;
+uniform vec3  uCamRight;
+uniform vec3  uCamUp;
+uniform float uRadio;
+out vec3 vWorld;    // posicion de este fragmento en el mundo
 void main() {
-    gl_Position  = uMVP * vec4(inPos, 1.0);
-    float persp  = 55.0 / max(gl_Position.w, 0.02);
-    // Tamaño acotado: crece con la cercania pero sin desbordarse
-    gl_PointSize = clamp(24.0 * persp, 14.0, 220.0);
+    vWorld = uCentro + uCamRight * (inCorner.x * uRadio)
+                     + uCamUp    * (inCorner.y * uRadio);
+    gl_Position = uMVP * vec4(vWorld, 1.0);
 }
 )glsl";
 
 static const char* BH_FS_SOURCE = R"glsl(
 #version 330 core
+in vec3 vWorld;
 out vec4 fragColor;
+uniform vec3  uCamPos;
+uniform vec3  uCentro;
+uniform float uRadio;
+uniform float uTime;
+
+// Gas a millones de grados: blanco en el interior, salmon hacia fuera.
+vec3 discoColor(float t) {
+    vec3 blanco = vec3(1.00, 0.99, 0.96);
+    vec3 crema  = vec3(1.00, 0.88, 0.70);
+    vec3 salmon = vec3(1.00, 0.62, 0.38);
+    vec3 c = mix(blanco, crema, smoothstep(0.0, 0.45, t));
+    return mix(c, salmon, smoothstep(0.45, 1.0, t));
+}
+
+float hash(vec2 p) { return fract(sin(dot(p, vec2(41.3, 289.1))) * 43758.5453); }
+float ruido(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash(i), hash(i + vec2(1,0)), f.x),
+               mix(hash(i + vec2(0,1)), hash(i + vec2(1,1)), f.x), f.y);
+}
+
 void main() {
-    vec2  uv = gl_PointCoord - 0.5;
-    float d  = length(uv) * 2.0;   // 0 centro, 1 borde
+    // Rayo desde la camara hacia este pixel, en coordenadas del agujero negro
+    vec3 p = uCamPos - uCentro;
+    vec3 v = normalize(vWorld - uCamPos);
 
-    float horizon = 1.0 - smoothstep(0.34, 0.40, d);       // disco negro opaco
-    float ring    = smoothstep(0.40, 0.46, d) * (1.0 - smoothstep(0.52, 0.72, d));
-    float glow    = (1.0 - smoothstep(0.40, 1.0, d));
-    if (d > 1.0) discard;
+    // El fenomeno ocupa el 45% central del quad: deja margen para que los arcos
+    // lenteados (que caen mas afuera que el disco) no los corte el cuadrado.
+    float Rs   = uRadio * 0.085;         // radio del horizonte de sucesos
+    float GM   = Rs * 0.5;               // GM/c^2 = Rs/2
+    float rIn  = Rs * 2.4;               // borde interior del disco
+    float rOut = uRadio * 0.40;          // borde exterior del disco
+    float lejos = uRadio * 1.15;         // fuera de aqui ya no pasa nada
 
-    // Color del anillo de acrecion: interior blanco-ardiente -> naranja exterior
-    vec3 ringCol = mix(vec3(1.0, 0.95, 0.8), vec3(1.0, 0.5, 0.15),
-                       smoothstep(0.46, 0.72, d));
-    vec3 col = ringCol * (ring * 2.2 + glow * 0.5);
+    vec3  col = vec3(0.0);
+    float alpha = 0.0;
+    bool  cayo = false;
 
-    // Composicion: horizonte negro opaco domina el centro
-    float a = max(horizon, clamp(ring * 1.5 + glow * 0.4, 0.0, 1.0));
-    col = mix(col, vec3(0.0), horizon);   // centro negro solido
-    fragColor = vec4(col, a);
+    // Saltamos el vacio: llevamos el rayo justo al borde de la zona de accion.
+    // Sin esto gastaba todos los pasos viajando y NO LLEGABA al agujero cuando
+    // la camara estaba lejos: el agujero negro se volvia invisible de lejos.
+    float haciaBH = -dot(p, v);                    // distancia al punto mas cercano
+    float b2 = dot(p, p) - haciaBH * haciaBH;      // parametro de impacto^2
+    if (b2 > lejos * lejos) discard;               // el rayo pasa de largo
+    float entrada = haciaBH - sqrt(max(lejos * lejos - b2, 0.0));
+    if (entrada > 0.0) p += v * entrada;
+
+    // Jitter: si todos los rayos avanzan en fase, los pasos discretos dibujan
+    // anillos concentricos. Desfasar cada pixel lo disuelve en ruido fino.
+    float jitter = ruido(gl_FragCoord.xy * 0.7);
+
+    for (int i = 0; i < 300; i++) {
+        float r = length(p);
+
+        if (r < Rs) { cayo = true; break; }        // cayo dentro del horizonte
+        if (r > lejos * 1.6 && dot(v, p) > 0.0) break;   // ya escapo
+
+        // Paso adaptativo: fino cerca (mucha curvatura), amplio lejos. Con el
+        // jitter no deja bandeo, y asi 300 pasos alcanzan desde cualquier
+        // distancia.
+        float dt = clamp((r - Rs) * 0.16, uRadio * 0.004, uRadio * 0.030);
+        if (i == 0) dt *= (0.4 + 0.6 * jitter);
+
+        // Curvatura del rayo. Para fotones la desviacion es 1.5x la newtoniana
+        // (relatividad general): por eso la sombra se ve mayor que el horizonte.
+        vec3 a  = -normalize(p) * (1.5 * GM / (r * r));
+        vec3 vN = normalize(v + a * dt);
+        vec3 pN = p + vN * dt;
+
+        // ¿Cruzo el plano del disco? (el disco vive en el plano XZ, y=0)
+        if (p.y * pN.y < 0.0) {
+            float f   = p.y / (p.y - pN.y);        // punto exacto del cruce
+            vec3  hit = mix(p, pN, f);
+            float rd  = length(hit.xz);
+            if (rd > rIn && rd < rOut) {
+                float t = (rd - rIn) / (rOut - rIn);
+
+                // Bordes suaves: sin esto el disco corta en seco y se ve el filo
+                float suave = smoothstep(0.0, 0.10, t) * (1.0 - smoothstep(0.72, 1.0, t));
+
+                // Turbulencia girando (kepleriana: dentro va mas rapido)
+                float ang = atan(hit.z, hit.x);
+                float vel = uTime * 1.0 / max(pow(rd / rIn, 1.5), 0.35);
+                float n   = ruido(vec2(ang * 2.2 + vel, rd / uRadio * 20.0));
+                float brillo = (0.55 + 0.75 * n) * pow(1.0 - t, 0.7);
+
+                // Doppler beaming con la velocidad tangencial real del gas.
+                // Suave a proposito: con factor 1.25 el lado que se aleja caia
+                // a 0.15 y desaparecia (medio disco "borrado"). En Interstellar
+                // tambien lo atenuaron: la fisica real deja un lado casi negro
+                // y visualmente queda mal.
+                vec3  tang = normalize(vec3(-hit.z, 0.0, hit.x));
+                float dop  = clamp(1.0 + 0.32 * dot(tang, -vN), 0.74, 1.5);
+
+                // Corrimiento gravitacional: se apaga cerca del horizonte
+                float grav = clamp(1.0 - Rs / rd, 0.25, 1.0);
+
+                float emi = brillo * dop * grav * suave * 1.6;
+                // (1-alpha): lo que ya recogimos por delante tapa lo de detras
+                col   += discoColor(t) * emi * (1.0 - alpha);
+                alpha += emi * 0.8 * (1.0 - alpha);
+            }
+        }
+
+        p = pN;  v = vN;
+    }
+
+    // Si el rayo cayo al agujero, lo de DETRAS no se ve... pero la luz que
+    // recogio ANTES de caer (el disco que pasa por DELANTE de la esfera) si:
+    // esta entre la camara y el horizonte. Por eso NO se borra col.
+    if (cayo) alpha = 1.0;
+
+    if (alpha < 0.004) discard;
+    fragColor = vec4(col, alpha);
 }
 )glsl";
 
@@ -927,7 +1263,9 @@ void main() {
 #define NUM_BG_TOTAL       (NUM_BG_STARS + NUM_BG_GALAXIES * STARS_PER_GALAXY \
                             + NUM_BG_BLUE)
 #define NUM_NEBULAE        16      // nubes de nebulosa de fondo (billboards)
-#define NUM_DUST           260     // nubes de polvo estelar en los brazos (billboards)
+#define NUM_DUST           220     // nubes de polvo en los brazos (menos que en la
+                                   // galaxia original: esta nace del halo y tiene ~27k
+                                   // estrellas en vez de 200k, el polvo la tapaba)
 
 static const char* BG_VS_SOURCE = R"glsl(
 #version 330 core
@@ -1006,8 +1344,10 @@ layout(location = 2) in vec3  inParams;   // x=size, y=hue, z=seed
 uniform mat4 uMVP;
 uniform vec3 uCamRight;
 uniform vec3 uCamUp;
-// uOrigen: las nebulosas se generaron alrededor del origen (la galaxia original
-// vivia ahi). Ahora la galaxia nace en el halo, asi que hay que moverlas con ella.
+// uOrigen: a que punto se anclan estos billboards.
+//   - POLVO de los brazos  -> el halo (viaja con la galaxia)
+//   - NEBULOSAS de fondo   -> la camara (son decorado lejano, radio 60-150:
+//     si se anclan al halo acaban ENCIMA de la camara como manchas gigantes)
 uniform vec3 uOrigen;
 out vec2  vUV;
 out float vHue;
@@ -1029,6 +1369,7 @@ in vec2  vUV;
 in float vHue;
 in float vSeed;
 out vec4 fragColor;
+uniform float uFade;   // 0 = universo (sin decorado), 1 = galaxia
 
 // Ruido de valor + fBm (varias octavas) -> textura de nube turbulenta
 float hash21(vec2 p) {
@@ -1076,7 +1417,10 @@ void main() {
     // Un poco mas brillante donde el gas es mas denso
     c *= 0.6 + 0.6 * n;
 
-    float a = density * 0.28;   // translucido pero visible
+    // uFade: las nebulosas son decorado de la galaxia. Entran progresivamente
+    // durante el morph en vez de aparecer de golpe al 100%.
+    float a = density * 0.22 * uFade;   // translucido pero visible
+    if (a < 0.002) discard;
     fragColor = vec4(c * a, a);
 }
 )glsl";
@@ -1090,6 +1434,7 @@ in vec2  vUV;
 in float vHue;
 in float vSeed;
 out vec4 fragColor;
+uniform float uFade;   // 0 = universo (sin decorado), 1 = galaxia
 
 float hash21(vec2 p) {
     p = fract(p * vec2(123.34, 456.21));
@@ -1131,7 +1476,11 @@ void main() {
     c      = mix(c, cBlue, smoothstep(0.93, 1.0, vHue));
     c *= 0.6 + 0.6 * n;
 
-    float a = density * 0.30;
+    // Si el polvo se ve como bolas opacas NO es la opacidad: es que el blending
+    // esta apagado (el bloom lo desactiva cada frame). Ver el glEnable(GL_BLEND)
+    // al principio del render.
+    float a = density * 0.26 * uFade;
+    if (a < 0.002) discard;
     fragColor = vec4(c * a, a);
 }
 )glsl";
@@ -1531,9 +1880,10 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaMalloc(&dCoM, 4 * sizeof(float)));
 
     // Buffers de la transicion halo -> galaxia (origen y destino del morph)
-    Body *dPosOrigen, *dPosDestino;
+    Body *dPosOrigen, *dPosDestino, *dVelDestino;
     CUDA_CHECK(cudaMalloc(&dPosOrigen, bytes));
     CUDA_CHECK(cudaMalloc(&dPosDestino, bytes));
+    CUDA_CHECK(cudaMalloc(&dVelDestino, bytes));   // velocidades orbitales de la galaxia
     // slot[i]: hueco de la galaxia que ocupara la particula i (-1 = se queda
     // como telarana cosmica). dContador cuenta cuantas caen en el halo.
     int *dSlot, *dContador, *dBhIdx;
@@ -1730,6 +2080,8 @@ int main(int argc, char** argv)
     GLuint dustProg     = buildProgram(NEB_VS_SOURCE, DUST_FS_SOURCE);
     GLint  nebLocOrigen  = glGetUniformLocation(nebProg,  "uOrigen");
     GLint  dustLocOrigen = glGetUniformLocation(dustProg, "uOrigen");
+    GLint  nebLocFade    = glGetUniformLocation(nebProg,  "uFade");
+    GLint  dustLocFade   = glGetUniformLocation(dustProg, "uFade");
     GLint  dustLocMVP   = glGetUniformLocation(dustProg, "uMVP");
     GLint  dustLocRight = glGetUniformLocation(dustProg, "uCamRight");
     GLint  dustLocUp    = glGetUniformLocation(dustProg, "uCamUp");
@@ -1742,7 +2094,27 @@ int main(int argc, char** argv)
 
     // Programa dedicado del agujero negro (alpha blending)
     GLuint bhProg     = buildProgram(BH_VS_SOURCE, BH_FS_SOURCE);
-    GLint  bhLocMVP   = glGetUniformLocation(bhProg, "uMVP");
+    GLint  bhLocMVP    = glGetUniformLocation(bhProg, "uMVP");
+    GLint  bhLocTime   = glGetUniformLocation(bhProg, "uTime");
+    GLint  bhLocCentro = glGetUniformLocation(bhProg, "uCentro");
+    GLint  bhLocRight  = glGetUniformLocation(bhProg, "uCamRight");
+    GLint  bhLocUp     = glGetUniformLocation(bhProg, "uCamUp");
+    GLint  bhLocRadio  = glGetUniformLocation(bhProg, "uRadio");
+    GLint  bhLocCam    = glGetUniformLocation(bhProg, "uCamPos");
+
+    // Quad del agujero negro: 6 vertices con las esquinas en [-1,1].
+    // El vertex shader lo orienta hacia la camara y lo escala con uRadio.
+    GLuint bhVAO, bhVBO;
+    {
+        float esquinas[12] = { -1,-1,  1,-1,  1, 1,   -1,-1,  1, 1,  -1, 1 };
+        glGenVertexArrays(1, &bhVAO);
+        glGenBuffers(1, &bhVBO);
+        glBindVertexArray(bhVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, bhVBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(esquinas), esquinas, GL_STATIC_DRAW);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2*sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+    }
 
     // ── Estado OpenGL ──────────────────────────────────────────────────────
     glEnable(GL_BLEND);
@@ -1899,6 +2271,11 @@ int main(int argc, char** argv)
                     CUDA_CHECK(cudaMemcpy(dPosDestino, hPos,
                                           (size_t)g_app.nGal * sizeof(Body),
                                           cudaMemcpyHostToDevice));
+                    // Las velocidades ORBITALES que calculo initGalaxy. Sin
+                    // ellas la galaxia no rota y se deshace (bug historico).
+                    CUDA_CHECK(cudaMemcpy(dVelDestino, hVel,
+                                          (size_t)g_app.nGal * sizeof(Body),
+                                          cudaMemcpyHostToDevice));
                     g_app.morphT = 0.0f;
                     g_app.acto = ACTO_MORPH;
                 } else {
@@ -1975,6 +2352,9 @@ int main(int argc, char** argv)
                                                 g_app.haloX, g_app.haloY, g_app.haloZ);
 
             if (g_app.morphT >= 1.0f) {
+                // Cada estrella recibe su velocidad orbital -> la galaxia rota
+                kernelAsignarVelGalaxia<<<gridSim, TILE_SIZE>>>(dPos, dVel, dVelDestino,
+                                                                dSlot, N, g_app.nGal);
                 // Ya esta formada: activamos la fisica de la galaxia
                 bool  per  = false;          // la galaxia no vive en caja periodica
                 float gG   = G;
@@ -2004,12 +2384,34 @@ int main(int argc, char** argv)
             // deriva visiblemente respecto de las estrellas.
             if (g_app.acto == ACTO_GALAXIA) {
                 CUDA_CHECK(cudaMemset(dCoM, 0, 4 * sizeof(float)));
-                kernelAcumCoM<<<gridSim, TILE_SIZE>>>(dPos, N, dCoM, g_app.bhIdx);
+                kernelAcumCoM<<<gridSim, TILE_SIZE>>>(dPos, N, dCoM, g_app.bhIdx, dSlot);
                 kernelFijarBHalCoM<<<1, 1>>>(dPos, dCoM, g_app.bhIdx);
+                // Se traga lo que se acerca demasiado. El radio (0.42) es el
+                // del DISCO DE ACRECION, no el del horizonte (0.085): antes
+                // absorbia solo dentro del horizonte y las estrellas que
+                // pasaban entre medias cruzaban el disco brillante a la vista.
+                //
+                // Y es fisicamente correcto: una estrella que se acerca tanto a
+                // un agujero negro supermasivo la despedazan las fuerzas de
+                // MAREA mucho antes de cruzar el horizonte, y sus restos
+                // alimentan el disco. No necesita llegar al horizonte para
+                // desaparecer.
+                kernelAbsorber<<<gridSim, TILE_SIZE>>>(dPos, dVel, N, g_app.bhIdx,
+                                                       RADIO_BH * 0.42f);
             }
 
             g_app.steps++;
             g_app.simTime += dtSim;
+        }
+
+        // ── Fundido del decorado de galaxia (nebulosas, polvo, fondo) ─────
+        // Todo eso es de la GALAXIA: en el universo no debe verse, y debe
+        // ENTRAR progresivamente durante el morph, no aparecer de golpe.
+        float fadeDeco;
+        {
+            float m = (g_app.acto == ACTO_GALAXIA) ? 1.0f :
+                      (g_app.acto == ACTO_MORPH)   ? fminf(1.0f, g_app.morphT) : 0.0f;
+            fadeDeco = m * m * (3.0f - 2.0f * m);   // suavizado
         }
 
         // ── Copiar posiciones al VBO (CUDA→OpenGL sin pasar por CPU) ──────
@@ -2019,7 +2421,14 @@ int main(int argc, char** argv)
         CUDA_CHECK(cudaGraphicsResourceGetMappedPointer(
                        (void**)&devVBOPtr, &vboSize, cudaVBORes));
 
-        kernelCopiaVBO<<<gridCopy, 256>>>(dPos, devVBOPtr, N);
+        // En el ACTO 1 no hay slots todavia -> se pasa NULL y no se atenua nada.
+        // Al formarse la galaxia la telarana baja a un 18% de su brillo.
+        {
+            const int* slotRender = (g_app.acto == ACTO_UNIVERSO || g_app.acto == ACTO_ZOOM)
+                                    ? NULL : dSlot;
+            float aten = 1.0f - 0.82f * fadeDeco;
+            kernelCopiaVBO<<<gridCopy, 256>>>(dPos, devVBOPtr, N, slotRender, aten);
+        }
 
         CUDA_CHECK(cudaGraphicsUnmapResources(1, &cudaVBORes, 0));
 
@@ -2038,6 +2447,16 @@ int main(int argc, char** argv)
         buildViewMatrix(view, g_cam.posX, g_cam.posY, g_cam.posZ, g_cam.yaw, g_cam.pitch);
         mat4Mul(mvp, proj, view);
 
+        // ── Estado de dibujo de la escena (SE FIJA CADA FRAME) ────────────
+        // No se puede dar por hecho: el bloom hace glDisable(GL_BLEND) mas
+        // abajo, y la pasada del agujero negro (que antes lo reactivaba) ahora
+        // es condicional. Sin esto, a partir del segundo frame los billboards
+        // se dibujaban OPACOS: las nubes de polvo salian como bolas negras
+        // tapando las estrellas.
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE);   // aditivo: las zonas densas brillan
+        glDisable(GL_DEPTH_TEST);            // la transparencia aditiva no usa depth
+
         // Fondo de estrellas lejanas (se dibuja primero, de fondo)
         glUseProgram(bgProg);
         glUniformMatrix4fv(bgLocMVP, 1, GL_FALSE, mvp);
@@ -2045,9 +2464,7 @@ int main(int argc, char** argv)
         // en el ACTO 1 estamos mirando el cosmos entero, no tiene sentido.
         // Entra progresivamente durante el morph.
         {
-            float fadeBG = (g_app.acto == ACTO_GALAXIA) ? 1.0f :
-                           (g_app.acto == ACTO_MORPH)   ? fminf(1.0f, g_app.morphT) : 0.0f;
-            glUniform1f(bgLocFade, fadeBG);
+            glUniform1f(bgLocFade, fadeDeco);
             // el skybox se mueve con la camara -> horizonte inalcanzable
             glUniform3f(bgLocCam, g_cam.posX, g_cam.posY, g_cam.posZ);
         }
@@ -2069,7 +2486,11 @@ int main(int argc, char** argv)
             float uz = rx*fy - ry*fx;
             glUseProgram(nebProg);
             glUniformMatrix4fv(nebLocMVP, 1, GL_FALSE, mvp);
-            glUniform3f(nebLocOrigen, g_app.haloX, g_app.haloY, g_app.haloZ);
+            // Skybox: las nebulosas viajan con la camara -> quedan siempre
+            // lejanas, como el fondo de estrellas. Ancladas al halo se metian
+            // dentro de la escena (radio 60-150, tamano 18-44).
+            glUniform3f(nebLocOrigen, g_cam.posX, g_cam.posY, g_cam.posZ);
+            glUniform1f(nebLocFade, fadeDeco);
             glUniform3f(nebLocRight, rx, ry, rz);
             glUniform3f(nebLocUp, ux, uy, uz);
             glBindVertexArray(nebVAO);
@@ -2085,9 +2506,7 @@ int main(int argc, char** argv)
         // Durante el morph estos valores se interpolan tambien, si no habria un
         // salto visual (los puntos cambiarian de tamano/color de golpe).
         {
-            float m = (g_app.acto == ACTO_GALAXIA) ? 1.0f :
-                      (g_app.acto == ACTO_MORPH)   ? fminf(1.0f, g_app.morphT) : 0.0f;
-            float e = m * m * (3.0f - 2.0f * m);
+            float e = fadeDeco;
             glUniform1f(locMaxMass, 3.2f  + (0.92f - 3.2f) * e);
             glUniform1f(locMaxDist, UNIVERSE_BOX + (24.0f - UNIVERSE_BOX) * e);
         }
@@ -2109,6 +2528,7 @@ int main(int argc, char** argv)
             glUseProgram(dustProg);
             glUniformMatrix4fv(dustLocMVP, 1, GL_FALSE, mvp);
             glUniform3f(dustLocOrigen, g_app.haloX, g_app.haloY, g_app.haloZ);
+            glUniform1f(dustLocFade, fadeDeco);
             glUniform3f(dustLocRight, rx, ry, rz);
             glUniform3f(dustLocUp, ux, uy, uz);
             glBindVertexArray(dustVAO);
@@ -2159,13 +2579,41 @@ int main(int argc, char** argv)
         // ── Agujero negro ENCIMA del bloom: horizonte negro opaco y limpio ──
         // Solo en el acto GALAXIA: en el universo no hay agujero negro central
         // (el cuerpo 0 es una particula mas de materia oscura).
-        if (g_app.acto == ACTO_GALAXIA || (g_app.acto == ACTO_MORPH && g_app.morphT > 0.5f)) {
+        // ── Agujero negro: billboard ENCIMA del bloom ──
+        // Nace como semilla en el centro del halo en cuanto empieza el morph y
+        // crece ahi mientras la materia cae. Su tamano es un RADIO DEL MUNDO,
+        // asi la perspectiva funciona sola (antes, con point-sprite y clamp,
+        // cerca se veia pequeno y lejos grande).
+        if (g_app.acto == ACTO_GALAXIA || g_app.acto == ACTO_MORPH) {
+            float crecer = (g_app.acto == ACTO_GALAXIA) ? 1.0f
+                         : fminf(1.0f, g_app.morphT / 0.75f);
+            // 8% al nacer -> tamano final; ^0.6 = crece rapido y luego se asienta
+            float radio = RADIO_BH * (0.08f + 0.92f * powf(crecer, 0.6f));
+
+            // Su posicion la mueve la GPU (kernelFijarBHalCoM): la leemos.
+            Body bhPos;
+            CUDA_CHECK(cudaMemcpy(&bhPos, dPos + g_app.bhIdx, sizeof(Body),
+                                  cudaMemcpyDeviceToHost));
+
+            float fx, fy, fz;
+            camForward(g_cam.yaw, g_cam.pitch, &fx, &fy, &fz);
+            float rx = -fz, ry = 0.0f, rz = fx;
+            float rl = sqrtf(rx*rx + rz*rz);
+            if (rl > 1e-6f) { rx /= rl; rz /= rl; }
+            float ux = ry*fz - rz*fy, uy = rz*fx - rx*fz, uz = rx*fy - ry*fx;
+
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glUseProgram(bhProg);
             glUniformMatrix4fv(bhLocMVP, 1, GL_FALSE, mvp);
-            glBindVertexArray(vao);
-            glDrawArrays(GL_POINTS, g_app.bhIdx, 1);   // el agujero negro real
+            glUniform1f(bhLocTime, (float)glfwGetTime());
+            glUniform3f(bhLocCentro, bhPos.x, bhPos.y, bhPos.z);
+            glUniform3f(bhLocRight, rx, ry, rz);
+            glUniform3f(bhLocUp, ux, uy, uz);
+            glUniform1f(bhLocRadio, radio);
+            glUniform3f(bhLocCam, g_cam.posX, g_cam.posY, g_cam.posZ);
+            glBindVertexArray(bhVAO);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE);
         }
 
