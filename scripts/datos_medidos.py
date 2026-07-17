@@ -82,21 +82,27 @@ RANKS = ["PC1 · RTX 4060", "PC2 · RTX 3050", "PC3 · AMD RX 6600 XT"]
 # Los tiempos son POR RANK. Importa: en la salida del script, "calculo (max)" y
 # "comunicacion (max)" son maximos de ranks DISTINTOS, asi que no suman el total
 # y apilarlos en un grafico enganaria. Por rank si cuadra: calculo + red = total.
+# Las referencias LOCALES (3 procesos en un solo PC, sin red) se midieron con el
+# mismo codigo y la misma config que las corridas por internet. Los 3 procesos
+# comparten la 4060, asi que no son 3 GPUs de verdad: son la medida de "cuanto
+# costaria esto sin salir de casa", que es contra lo que hay que comparar.
+#   mpiexec -n 3 python scripts/nbody_distribuido.py --n <N> --steps <S> --backend auto
 MODO_B = [
     {
-        # La referencia: mismo codigo, mismo N, pero SIN red. Los 3 procesos
-        # comparten la 4060 de PC1, asi que no hay 3 GPUs de verdad — es la
-        # medida de "cuanto costaria esto sin salir de casa".
-        #   mpiexec -n 3 python scripts/nbody_distribuido.py --n 150000 --steps 20 --backend auto
-        "etiqueta": "N=148.877\n(local, 1 PC)",
-        "n": 148877, "pasos": 20, "datos_mb_paso": 3.6, "local": True,
-        "ranks": [(7.29, 0.08, 7.36), (7.33, 0.03, 7.36), (7.34, 0.02, 7.36)],
+        "etiqueta": "N=19.683\n(local, 1 PC)",
+        "n": 19683, "pasos": 50, "datos_mb_paso": 0.5, "local": True,
+        # rank: (calculo_s, red_s, total_s)
+        "ranks": [(0.96, 0.02, 0.98), (0.96, 0.02, 0.98), (0.96, 0.02, 0.98)],
     },
     {
         "etiqueta": "N=19.683\n(relay DERP)",
         "n": 19683, "pasos": 50, "datos_mb_paso": 0.5,
-        # rank: (calculo_s, red_s, total_s)
         "ranks": [(1.54, 19.16, 20.72), (1.84, 18.76, 20.70), (0.24, 20.36, 20.71)],
+    },
+    {
+        "etiqueta": "N=148.877\n(local, 1 PC)",
+        "n": 148877, "pasos": 20, "datos_mb_paso": 3.6, "local": True,
+        "ranks": [(7.29, 0.08, 7.36), (7.33, 0.03, 7.36), (7.34, 0.02, 7.36)],
     },
     {
         "etiqueta": "N=148.877\n(relay DERP)",
@@ -113,16 +119,25 @@ MODO_B = [
 def modo_b_penalizacion():
     """Cuanto mas lento sale repartir por internet que hacerlo en un solo PC.
 
-    Comparables: mismo N (148.877), mismos 20 pasos, mismo codigo."""
-    local = next(e for e in MODO_B if e.get("local"))
-    t_local = max(r[2] for r in local["ranks"])
+    Cada escenario se compara SOLO contra el local de su misma configuracion.
+    Mezclar N distintos en una tabla fue justo el error de la version anterior:
+    se comparaba el local de N=19.683 contra los internet de N=148.877.
+
+    Lo interesante es que la penalizacion BAJA al crecer N (21x -> 7.6x): el
+    calculo crece O(N^2) y los datos solo O(N), asi que cuanto mas grande es el
+    problema, menos pesa la red. De ahi que exista un punto de equilibrio."""
+    locales = {(e["n"], e["pasos"]): max(r[2] for r in e["ranks"])
+               for e in MODO_B if e.get("local")}
     out = []
     for e in MODO_B:
-        if e.get("local") or e["n"] != local["n"]:
+        if e.get("local"):
+            continue
+        t_local = locales.get((e["n"], e["pasos"]))
+        if t_local is None:
             continue
         t = max(r[2] for r in e["ranks"])
-        out.append((e["etiqueta"], t, t / t_local))
-    return t_local, out
+        out.append((e["etiqueta"], e["n"], t_local, t, t / t_local))
+    return out
 
 
 # La conclusion, con numeros:
