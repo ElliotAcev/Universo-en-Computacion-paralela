@@ -17,42 +17,63 @@ import numpy as np
 
 
 def medir_cluster(carpeta="dataset"):
-    """Lee el speedup MEDIDO en la ultima corrida distribuida real.
-    Los tiempos los guarda generar_universos.py (no se estiman aqui)."""
-    ruta = os.path.join(carpeta, "cluster_stats.npz")
-    if not os.path.exists(ruta):
-        return None
-    d = np.load(ruta)
-    return {
-        "procesos": int(d["procesos"]),
-        "universos": int(d["universos"]),
-        "tiempos_por_rank": d["tiempos_por_rank"],
-        "serie_s": float(d["t_serie"]),
-        "paralelo_s": float(d["t_paralelo"]),
-        "speedup": float(d["speedup"]),
+    """El speedup MEDIDO en la corrida de referencia (120 universos, 3 PCs).
+
+    Sale de datos_medidos.py, que guarda los tiempos por rank de la ejecucion
+    real junto con el comando que la produjo.
+
+    OJO con cluster_stats.npz: lo reescribe CUALQUIER corrida, hasta un test de
+    6 universos. Ya paso una vez y se llevo por delante los datos buenos. Por eso
+    la corrida de referencia se transcribe a datos_medidos.py y el npz solo se
+    usa para avisar si la ultima corrida fue otra."""
+    import datos_medidos as D
+
+    r = D.resumen()
+    info = {
+        "procesos": D.LOTE["procesos"],
+        "universos": D.LOTE["universos"],
+        "n": D.LOTE["n"],
+        "steps": D.LOTE["steps"],
+        "tiempos_por_rank": D.APRENDIDO["tiempos_rank"],
+        "reparto": D.APRENDIDO["reparto"],
+        "serie_s": D.APRENDIDO["t_serie"],
+        "paralelo_s": D.APRENDIDO["t_paralelo"],
+        "speedup": D.APRENDIDO["speedup"],
+        "eficiencia": r["eficiencia_aprendido"],
+        "ultima_corrida": None,
     }
+
+    ruta = os.path.join(carpeta, "cluster_stats.npz")
+    if os.path.exists(ruta):
+        d = np.load(ruta)
+        if int(d["universos"]) != D.LOTE["universos"]:
+            info["ultima_corrida"] = (int(d["universos"]), float(d["speedup"]))
+    return info
 
 
 def medir_balanceo():
-    """Reparto ingenuo vs proporcional entre 3 GPUs desiguales."""
-    vel = np.array([1.00, 0.60, 0.40])   # 4060, 3050, AMD
-    U = 60
-    coste = 1.0                          # coste relativo por universo
+    """Reparto ingenuo vs aprendido: los tiempos REALES de las dos corridas.
 
-    ingenuo = np.array([U // 3, U // 3, U - 2 * (U // 3)])
-    t_ing = (ingenuo * coste / vel).max()
+    No se modela nada: son dos ejecuciones de 120 universos en los mismos 3 PCs
+    en las que lo unico que cambio fue el reparto. Ver datos_medidos.py.
 
-    frac = vel / vel.sum()
-    aprend = np.floor(frac * U).astype(int)
-    aprend[0] += U - aprend.sum()
-    t_apr = (aprend * coste / vel).max()
+    (Antes esta funcion estimaba el reparto con vel=[1.00, 0.60, 0.40], unos
+    pesos que me invente ANTES de medir y que resultaron falsos: la AMD no era
+    0.40 sino 0.632. Reportaba un 40% de mejora que no le constaba a nadie.)"""
+    import datos_medidos as D
 
+    r = D.resumen()
     return {
-        "ingenuo_reparto": ingenuo.tolist(),
-        "aprendido_reparto": aprend.tolist(),
-        "t_ingenuo": t_ing,
-        "t_aprendido": t_apr,
-        "mejora_pct": (1 - t_apr / t_ing) * 100,
+        "ingenuo_reparto": D.INGENUO["reparto"],
+        "aprendido_reparto": D.APRENDIDO["reparto"],
+        "t_ingenuo": D.INGENUO["t_paralelo"],
+        "t_aprendido": D.APRENDIDO["t_paralelo"],
+        "speedup_ingenuo": D.INGENUO["speedup"],
+        "speedup_aprendido": D.APRENDIDO["speedup"],
+        "ocio_ingenuo": r["ocio_ingenuo"],
+        "ocio_aprendido": r["ocio_aprendido"],
+        "mejora_pct": r["mejora_speedup_pct"],
+        "mejora_tiempo_pct": r["mejora_tiempo_pct"],
     }
 
 
@@ -85,12 +106,39 @@ def medir_surrogate(carpeta="dataset"):
             torch.cuda.synchronize()
         t_inf = (time.perf_counter() - t0) / 100
 
-    # tiempo medio de simular un universo (de los datos)
-    tiempos = [float(np.load(a)["tiempo_s"]) for a in glob.glob(f"{carpeta}/universo_seed*.npz")
-               if "tiempo_s" in np.load(a)]
-    t_sim = np.mean(tiempos) if tiempos else 16.0
+    # ── Contra que se compara: simular UN universo, aqui y ahora ──
+    #
+    # NO se promedia el 'tiempo_s' del dataset. Esos ficheros son de dos corridas
+    # distintas (unos en GPU a ~0.25 s, otros de una tanda vieja en CPU a ~19 s):
+    # la fisica es la misma, pero mezclar sus cronometros da una media que no
+    # corresponde a ninguna maquina real. Promediarlos daba un "13.000x" absurdo.
+    #
+    # Se mide en vivo, en la MISMA GPU que acaba de correr la inferencia, con la
+    # misma configuracion con la que se entreno el surrogate. Comparacion justa.
+    ejemplo = sorted(glob.glob(f"{carpeta}/universo_seed*.npz"))
+    if not ejemplo:
+        return None
+    meta = np.load(ejemplo[0])
+    n, steps = int(meta["n"]), int(meta["steps"])
+
+    from simular_universo import simular
+    from compute import create_backend
+
+    # Sin backend explicito, simular() cae a NumPy (CPU) y estariamos comparando
+    # una GPU contra una CPU: el surrogate saldria ~100x mejor de lo que es.
+    bk = create_backend("auto")
+
+    simular(n=n, steps=5, seed=999, backend=bk)   # calentar (kernel + VRAM)
+    reps, t0 = 3, time.perf_counter()
+    for k in range(reps):
+        simular(n=n, steps=steps, seed=900 + k, backend=bk)
+    t_sim = (time.perf_counter() - t0) / reps
+
     return {
         "dispositivo": disp,
+        "backend_sim": type(bk).__name__,
+        "n": n,
+        "steps": steps,
         "inferencia_ms": t_inf * 1000,
         "simulacion_ms": t_sim * 1000,
         "aceleracion": t_sim / t_inf,
@@ -111,29 +159,41 @@ def main():
 
     barra("1. CLUSTER — Generacion distribuida (speedup MEDIDO)")
     c = medir_cluster()
-    if c:
-        print(f"  Procesos MPI             : {c['procesos']}")
-        print(f"  Universos generados      : {c['universos']}")
-        for r, t in enumerate(c["tiempos_por_rank"]):
-            print(f"    rank {r}: {t:.1f} s")
-        print(f"  Trabajo total (1 proceso): {c['serie_s']:.0f} s")
-        print(f"  Tiempo real del lote     : {c['paralelo_s']:.0f} s  (manda el mas lento)")
-        print(f"  >> SPEEDUP MEDIDO        : {c['speedup']:.2f}x")
-    else:
-        print("  (sin datos: corre generar_universos.py con mpiexec primero)")
+    print(f"  Procesos MPI             : {c['procesos']} (3 PCs, 3 casas, via Tailscale)")
+    print(f"  Universos generados      : {c['universos']} (N={c['n']}, {c['steps']} pasos)")
+    for r, (t, u) in enumerate(zip(c["tiempos_por_rank"], c["reparto"])):
+        print(f"    rank {r}: {u:2} universos en {t:5.1f} s")
+    print(f"  Trabajo total (1 proceso): {c['serie_s']:.1f} s")
+    print(f"  Tiempo real del lote     : {c['paralelo_s']:.1f} s  (manda el mas lento)")
+    print(f"  >> SPEEDUP MEDIDO        : {c['speedup']:.2f}x  "
+          f"(eficiencia {c['eficiencia']*100:.1f}%)")
+    if c["ultima_corrida"]:
+        u, s = c["ultima_corrida"]
+        print(f"\n  (nota: la ultima corrida guardada en cluster_stats.npz fue de {u} "
+              f"universos\n   a {s:.2f}x — una prueba, no la corrida de referencia)")
 
     barra("2. BALANCEO — Modelo 1 (reparto entre GPUs desiguales)")
     b = medir_balanceo()
-    print(f"  Reparto ingenuo (4060/3050/AMD) : {b['ingenuo_reparto']}")
-    print(f"  Reparto aprendido               : {b['aprendido_reparto']}")
-    print(f"  >> MEJORA                       : {b['mejora_pct']:.1f}% mas rapido por lote")
+    print(f"  {'':32}  {'INGENUO':>10}  {'APRENDIDO':>10}")
+    print(f"  Reparto (4060/3050/AMD)         : "
+          f"{'/'.join(map(str, b['ingenuo_reparto'])):>10}  "
+          f"{'/'.join(map(str, b['aprendido_reparto'])):>10}")
+    print(f"  Tiempo del lote                 : "
+          f"{b['t_ingenuo']:>9.1f}s  {b['t_aprendido']:>9.1f}s")
+    print(f"  Speedup                         : "
+          f"{b['speedup_ingenuo']:>9.2f}x  {b['speedup_aprendido']:>9.2f}x")
+    print(f"  Ocio (el rapido esperando)      : "
+          f"{b['ocio_ingenuo']:>9.1f}s  {b['ocio_aprendido']:>9.1f}s")
+    print(f"  >> MEJORA : +{b['mejora_pct']:.1f}% de speedup "
+          f"(-{b['mejora_tiempo_pct']:.1f}% de tiempo por lote)")
 
     barra("3. SURROGATE — Modelo 2 (emulador neuronal)")
     s = medir_surrogate()
     if s:
-        print(f"  Dispositivo              : {s['dispositivo']}")
-        print(f"  Inferencia del surrogate : {s['inferencia_ms']:.2f} ms")
-        print(f"  Simulacion real          : {s['simulacion_ms']:.0f} ms")
+        print(f"  Universo                 : N={s['n']}, {s['steps']} pasos")
+        print(f"  Los dos, en la misma GPU : {s['dispositivo']} / {s['backend_sim']}")
+        print(f"  Simulacion real          : {s['simulacion_ms']:8.1f} ms")
+        print(f"  Inferencia del surrogate : {s['inferencia_ms']:8.2f} ms")
         print(f"  >> ACELERACION           : ~{s['aceleracion']:.0f}x mas rapido")
     else:
         print("  (sin modelo: entrena el surrogate primero)")
