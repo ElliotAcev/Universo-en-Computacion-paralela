@@ -29,6 +29,19 @@
 #define G               0.00015f    // constante gravitacional escalada
 #define EPSILON2        0.08f       // suavizador (evita singularidades)
 #define DT              0.004f      // paso de tiempo
+// Particulas PROPIAS de la galaxia, aparte de las del universo.
+//
+// Antes la galaxia se hacia reconvirtiendo particulas de la telarana, lo que
+// dejaba un agujero esferico en el universo y, peor, convertia materia oscura
+// en estrellas (fisicamente imposible: la materia oscura no se enfria).
+//
+// Ahora la galaxia trae las suyas, como en una resimulacion de zoom real: se
+// re-simula la region con particulas NUEVAS. La telarana queda intacta.
+//
+// Bonus: la fisica solo corre sobre estas, no sobre las ~97k congeladas de la
+// telarana (que antes se sumaban al O(N^2) sin aportar nada).
+#define N_GALAXIA       60000
+
 // Radio visual del agujero negro, en unidades del mundo (la galaxia mide ~22).
 // Semi-tamano del QUAD del agujero negro, en unidades del mundo. Ojo: no es el
 // tamano del agujero: el fenomeno (sombra + disco + arcos lenteados) ocupa solo
@@ -137,7 +150,8 @@ typedef struct {
     int    autoAvance;      // 1 = la narrativa avanza sola con el tiempo
     float  zoomT;           // progreso del zoom [0..1]
     float  morphT;          // progreso de la transicion halo->galaxia [0..1]
-    int    nGal;            // particulas que forman la galaxia (las del halo)
+    int    nUni;            // particulas del universo/telarana: [0, nUni)
+    int    nGal;            // particulas propias de la galaxia: [nUni, nUni+nGal)
     int    bhIdx;           // indice REAL del agujero negro tras el morph
     float  haloX, haloY, haloZ;   // centro del halo elegido
     int    haloPop;         // particulas del halo
@@ -162,29 +176,42 @@ typedef struct {
  * pos[i] = (x, y, z, masa)
  * acc[i] = aceleracion acumulada para el cuerpo i
  */
+/*
+ * Fuerzas sobre el conjunto ACTIVO [inicio, inicio+cuantas).
+ *
+ * El buffer guarda dos poblaciones seguidas: primero el universo (la telarana)
+ * y despues la galaxia. Solo una esta viva a la vez:
+ *   ACTO_UNIVERSO  -> (0, nUni)        la telarana evoluciona
+ *   ACTO_GALAXIA   -> (nUni, N_GALAXIA) la galaxia evoluciona, la telarana ya
+ *                                       esta congelada y NO entra en el O(N^2)
+ * Antes el kernel barria las N particulas siempre, gastando el cuadrado del
+ * tiempo en particulas congeladas con masa ~0 que no aportaban nada.
+ */
 __global__ void kernelFuerzas(const Body* __restrict__ pos,
                                Body*       __restrict__ acc,
-                               int N)
+                               int inicio, int cuantas)
 {
     extern __shared__ Body tile[];
 
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int iLocal = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = inicio + iLocal;
 
     float3 pi  = {0,0,0};
     float3 ai  = {0,0,0};
 
-    if (i < N) {
+    if (iLocal < cuantas) {
         pi.x = pos[i].x;
         pi.y = pos[i].y;
         pi.z = pos[i].z;
     }
 
-    // Loop sobre tiles de TILE_SIZE cuerpos
-    int numTiles = (N + TILE_SIZE - 1) / TILE_SIZE;
+    // Loop sobre tiles de TILE_SIZE cuerpos (solo del conjunto activo)
+    int numTiles = (cuantas + TILE_SIZE - 1) / TILE_SIZE;
     for (int t = 0; t < numTiles; t++) {
         // Carga cooperativa: cada thread carga UN cuerpo al tile
-        int jGlobal = t * TILE_SIZE + threadIdx.x;
-        tile[threadIdx.x] = (jGlobal < N) ? pos[jGlobal] : make_float4(0,0,0,0);
+        int jLocal = t * TILE_SIZE + threadIdx.x;
+        tile[threadIdx.x] = (jLocal < cuantas) ? pos[inicio + jLocal]
+                                               : make_float4(0,0,0,0);
         __syncthreads();
 
         // Calcula fuerza contra los TILE_SIZE cuerpos del tile
@@ -213,7 +240,7 @@ __global__ void kernelFuerzas(const Body* __restrict__ pos,
         __syncthreads();
     }
 
-    if (i < N)
+    if (iLocal < cuantas)
         acc[i] = make_float4(ai.x, ai.y, ai.z, 0.0f);
 }
 
@@ -338,19 +365,20 @@ __global__ void kernelCoMCelda(const Body* __restrict__ pos, int N,
  *
  * com[0..2] = suma(m*pos),  com[3] = suma(m)
  */
-__global__ void kernelAcumCoM(const Body* __restrict__ pos, int N, float* com,
-                              int bh, const int* __restrict__ slot)
+/*
+ * Centro de masa de la GALAXIA ENTERA (recibe ya solo su rango).
+ *
+ * Antes promediaba las estrellas a menos de 4 del agujero, lo que creaba un
+ * bucle: si el agujero se desviaba, su zona de busqueda se iba con el, medía
+ * estrellas cada vez mas descentradas y se desviaba mas, hasta escaparse.
+ * Promediar toda la galaxia da un centro que NO depende de donde este.
+ */
+__global__ void kernelAcumCoM(const Body* __restrict__ pos, int nGal, float* com, int bh)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N || i == bh) return;
-
-    // Solo cuenta la galaxia: la telarana cosmica (slot < 0) es decorado.
-    if (slot != NULL && slot[i] < 0) return;
-
+    if (i >= nGal || i == bh) return;
     float m = pos[i].w;
-    if (m > 500.0f) return;      // otro cuerpo masivo (no deberia haber)
-    if (m <= 0.0f) return;       // absorbida por el agujero: ya no cuenta
-
+    if (m > 500.0f || m <= 0.0f) return;   // el agujero, o ya absorbida
     atomicAdd(&com[0], m * pos[i].x);
     atomicAdd(&com[1], m * pos[i].y);
     atomicAdd(&com[2], m * pos[i].z);
@@ -401,48 +429,6 @@ __global__ void kernelFijarBHalCoM(Body* __restrict__ pos, const float* com, int
 #define RADIO_HALO   28.0f
 
 /*
- * Marca que particulas caen dentro del halo y les asigna un hueco en la
- * galaxia. slot[i] = -1 -> esa particula se queda quieta (sigue siendo
- * telarana cosmica). slot[i] >= 0 -> ocupara ese sitio de la galaxia.
- */
-__global__ void kernelMarcarHalo(const Body* __restrict__ pos, int N,
-                                 float cx, float cy, float cz,
-                                 int* __restrict__ slot, int* __restrict__ contador,
-                                 int* __restrict__ bhIdx)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
-    // Distancia DIRECTA, sin imagen minima. Si usaramos la imagen periodica,
-    // la materia del borde opuesto entraria en la galaxia y tendria que cruzar
-    // todo el universo (o teletransportarse) para llegar: un salto visual
-    // enorme. Por eso buscarHalo() prefiere halos centrados, donde la esfera
-    // cabe entera sin tocar las fronteras.
-    float dx = pos[i].x - cx, dy = pos[i].y - cy, dz = pos[i].z - cz;
-    if (dx*dx + dy*dy + dz*dz <= RADIO_HALO * RADIO_HALO) {
-        int k = atomicAdd(contador, 1);
-        slot[i] = k;
-        // initGalaxy pone el agujero negro en el hueco 0. Ese hueco se lo lleva
-        // una particula cualquiera (la que gane el atomicAdd), NO la de indice 0.
-        // Guardamos QUE indice acabo siendo el agujero, porque el recentrado y
-        // el render lo necesitan.
-        if (k == 0) *bhIdx = i;
-    } else {
-        slot[i] = -1;   // fuera del halo: sigue siendo telarana cosmica
-    }
-}
-
-/*
- * Al terminar el morph, cada particula de la galaxia necesita SU velocidad
- * orbital (la que calculo initGalaxy), no la que traia del universo.
- *
- * Sin esto la galaxia no rota: las estrellas conservan las velocidades
- * aleatorias del Big Bang, el disco se deshace, el bulbo deriva... y como el
- * agujero negro se coloca en el centro de masa del bulbo, se va con el.
- *
- * La materia de fuera del halo (slot < 0) conserva su velocidad: sigue siendo
- * telarana cosmica y debe seguir su curso.
- */
-/*
  * El agujero negro DESTRUYE lo que se le acerca demasiado (disrupcion de marea).
  *
  * Sin esto las estrellas atraviesan el centro y salen por el otro lado: el
@@ -463,7 +449,7 @@ __global__ void kernelAbsorber(Body* __restrict__ pos, Body* __restrict__ vel,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N || i == bh) return;
     if (pos[i].w > 500.0f) return;      // el propio agujero negro
-    if (pos[i].w < 1e-6f) return;       // telarana congelada o ya absorbida
+    if (pos[i].w < 1e-6f) return;       // dormida o ya absorbida
 
     float dx = pos[i].x - pos[bh].x;
     float dy = pos[i].y - pos[bh].y;
@@ -474,79 +460,63 @@ __global__ void kernelAbsorber(Body* __restrict__ pos, Body* __restrict__ vel,
     }
 }
 
-__global__ void kernelAsignarVelGalaxia(Body* __restrict__ pos,
-                                        Body* __restrict__ vel,
-                                        const Body* __restrict__ velGal,
-                                        const int* __restrict__ slot,
-                                        int N, int nGal)
+
+__global__ void kernelAsignarVelGalaxia(Body* __restrict__ vel,
+                                        const Body* __restrict__ velGal, int nGal)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
-    int k = slot[i];
-
-    if (k >= 0 && k < nGal) {
-        vel[i] = velGal[k];              // la galaxia recibe sus velocidades orbitales
-        return;
-    }
-
-    // ── La telarana pasa a ser DECORADO DE FONDO ──
-    // Sus particulas pesan 1.0 (unidades del universo) mientras las estrellas de
-    // la galaxia pesan ~0.001-0.006 (unidades de initGalaxy): son ~300x mas
-    // pesadas, y quedan 37000 alrededor -> su masa total (~37000) compite con
-    // la del agujero negro (50000). Tiraban de la galaxia, la deformaban y
-    // arrastraban el bulbo... y el agujero negro, que se coloca en el centro de
-    // masa del bulbo, se iba con el.
-    // Solucion: masa despreciable (no ejercen gravedad) y quietas. Siguen
-    // viendose (kernelCopiaVBO les da su propio tamano de render).
-    pos[i].w = 1e-9f;
-    vel[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (i >= nGal) return;
+    // Velocidades ORBITALES de initGalaxy. Sin ellas la galaxia no rota, el
+    // disco se deshace y el bulbo deriva (bug historico).
+    vel[i] = velGal[i];
 }
 
 __global__ void kernelMorph(Body* __restrict__ pos,
                             const Body* __restrict__ origen,
                             const Body* __restrict__ destino,
-                            const int*  __restrict__ slot,
-                            int N, int nGal, float s, float cx, float cy, float cz)
+                            int nGal, float s, float cx, float cy, float cz)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
+    if (i >= nGal) return;
 
-    int k = slot[i];
-    if (k < 0 || k >= nGal) return;    // materia fuera del halo: NO se toca,
-                                       // sigue formando la telarana cosmica
+    // El agujero negro NO viaja: nace ya en el centro del halo como semilla y
+    // crece ahi. Si viajara desde su origen llegaria tarde y desde un lado,
+    // aterrizando en una galaxia ya formada.
+    if (i == 0) { pos[0] = destino[0]; return; }
 
-    // ── El agujero negro NO viaja ──
-    // El hueco 0 (que initGalaxy reserva para el agujero) se lo lleva una
-    // particula cualquiera, y si le tocaba una del borde del halo tenia que
-    // cruzar toda la galaxia... con retardo por distancia. Resultado: llegaba
-    // TARDE y desde un lado, aterrizando en una galaxia ya formada.
-    // Ahora nace directamente en el centro del halo. El salto no se ve porque
-    // arranca con un 8% de su tamano (uCrecer) y va creciendo ahi mismo.
-    if (k == 0) {
-        pos[i] = destino[0];
-        return;
-    }
-
-    // Sin imagen minima: la particula viaja desde donde esta, en linea recta.
-    // (kernelMarcarHalo ya se aseguro de que solo entren las que estan cerca
-    //  de verdad, sin cruzar fronteras.)
     float ox = origen[i].x, oy = origen[i].y, oz = origen[i].z;
     float dx = ox - cx, dy = oy - cy, dz = oz - cz;
 
-    // Retardo por distancia al centro del halo: el colapso ocurre de dentro
-    // hacia fuera, como en un colapso gravitacional real.
-    float d  = sqrtf(dx*dx + dy*dy + dz*dz) / RADIO_HALO;
+    // Retardo por distancia al centro: el colapso ocurre de dentro hacia fuera,
+    // como en un colapso gravitacional real.
+    float d = sqrtf(dx*dx + dy*dy + dz*dz) / RADIO_HALO;
     float retardo = fminf(0.55f, d * 0.55f);
 
     float t = (s - retardo) / fmaxf(0.05f, 1.0f - retardo);
     t = fminf(1.0f, fmaxf(0.0f, t));
     float e = t * t * (3.0f - 2.0f * t);          // suavizado (smoothstep)
 
-    pos[i].x = ox + (destino[k].x - ox) * e;
-    pos[i].y = oy + (destino[k].y - oy) * e;
-    pos[i].z = oz + (destino[k].z - oz) * e;
-    // la masa tambien transita (el universo es masa 1.0; la galaxia varia)
-    pos[i].w = origen[i].w + (destino[k].w - origen[i].w) * e;
+    pos[i].x = ox + (destino[i].x - ox) * e;
+    pos[i].y = oy + (destino[i].y - oy) * e;
+    pos[i].z = oz + (destino[i].z - oz) * e;
+    // La masa entra con el morph: 0 (dormida) -> su masa real. Asi el leapfrog
+    // no la integra hasta que existe, y el render la va revelando.
+    pos[i].w = destino[i].w * e;
+}
+
+/*
+ * Congela la telarana: masa ~0 para que no ejerza gravedad, y el leapfrog la
+ * salta (ver el chequeo de masa < 1e-6). Queda como decorado de fondo.
+ *
+ * Sin congelarla, sus particulas caian hacia el agujero negro: ponerles masa 0
+ * evita que EJERZAN gravedad, pero seguian RECIBIENDOLA.
+ */
+__global__ void kernelCongelarTelarana(Body* __restrict__ pos, Body* __restrict__ vel, int nUni)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nUni) return;
+    pos[i].w = 1e-9f;
+    vel[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 }
 
 /*
@@ -556,9 +526,7 @@ __global__ void kernelMorph(Body* __restrict__ pos,
  */
 __global__ void kernelCopiaVBO(const Body* __restrict__ pos,
                                 float*      __restrict__ devVBO,
-                                int N,
-                                const int* __restrict__ slot,
-                                float atenuacionWeb)
+                                int N, int nUni, float atenuacionWeb)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
@@ -567,33 +535,29 @@ __global__ void kernelCopiaVBO(const Body* __restrict__ pos,
     devVBO[i*4+1] = pos[i].y;
     devVBO[i*4+2] = pos[i].z;
 
-    // La telarana pasa a segundo plano al formarse la galaxia: si no, sus
-    // estrellas se pierden entre los miles de puntos del cubo (se ven iguales).
-    //
-    // Su tamano de render NO puede salir de la masa: al formarse la galaxia le
-    // ponemos masa ~0 para que no ejerza gravedad (competia con el agujero
-    // negro). Asi que aqui le damos un tamano propio, independiente de la
-    // fisica: separamos "cuanto pesa" de "como se ve".
     float m = pos[i].w;
-    bool esTelarana = (slot == NULL) || (slot[i] < 0);
 
-    if (esTelarana) {
-        // NUBES COSMICAS: buena parte de la telarana se dibuja como "neblina"
-        // (el shader la pinta grande y muy tenue). Al solaparse muchas forman
-        // luz continua: los filamentos dejan de ser puntos sueltos y pasan a
-        // ser gas difuso, como en las visualizaciones cosmologicas reales.
+    if (i < nUni) {
+        // ── TELARANA COSMICA ──
+        // Su tamaño de render NO sale de la masa: al congelarla le ponemos masa
+        // ~0 para que no ejerza gravedad. Aqui le damos un tamaño propio, o sea
+        // separamos "cuanto pesa" de "como se ve".
         //
-        // El marcador es la masa < 0.001, que activa esa rama del shader.
-        // Es SOLO render: la fisica no lo ve (la telarana esta congelada).
+        // NUBES COSMICAS: se reparte en las tres capas del shader. Al solaparse
+        // muchas nubes tenues forman luz continua: los filamentos dejan de ser
+        // puntos sueltos y pasan a ser gas difuso.
         //
-        // 45% neblina + 20% gas + 35% punto: las tres capas juntas dan
-        // profundidad (nucleos brillantes sobre un halo difuso).
-        int cara = i & 19;
-        if      (cara < 9)  m = 0.00055f;              // 45% -> nube difusa grande
+        // Al formarse la galaxia se atenua (no desaparece): la materia oscura
+        // no emite luz, la telarana es un MAPA DE DENSIDAD, no una foto. Cuando
+        // aparece luz de verdad (las estrellas), el mapa pasa a segundo plano.
+        int cara = i % 20;
+        if      (cara < 9)  m = 0.00055f;              // 45% -> nube difusa
         else if (cara < 13) m = 0.005f;                // 20% -> nube media
         else                m = 0.85f * atenuacionWeb; // 35% -> punto nitido
     }
-    else if (m <= 0.0f) m = -1.0f;    // absorbida por el agujero: no dibujar
+    else if (m <= 0.0f) {
+        m = -1.0f;   // galaxia aun dormida, o estrella absorbida: no dibujar
+    }
 
     devVBO[i*4+3] = m;
 }
@@ -1683,7 +1647,7 @@ static Camera   g_cam   = {UNIVERSE_BOX*0.5f, UNIVERSE_BOX*0.5f, -UNIVERSE_BOX*0
 // N, paused, showHelp, simTime, steps, fps, lastFPSTime, fpsFrames,
 // acto, actoT, autoAvance, zoomT, haloX/Y/Z, haloPop, zoomDesde*, fade, solicitarActo
 static AppState g_app   = {N_DEFAULT, 0, 1, 0.0, 0, 0.0f, 0.0, 0,
-                           ACTO_UNIVERSO, 0.0f, 1, 0.0f, 0.0f, 0, 0,
+                           ACTO_UNIVERSO, 0.0f, 1, 0.0f, 0.0f, 0, 0, 0,
                            0,0,0, 0, 0,0,0,0,0, 0.0f, 0};
 
 static void cbMouseButton(GLFWwindow* w, int btn, int action, int mods)
@@ -1776,13 +1740,13 @@ void benchmarkCPUvsGPU(int N)
     size_t shMem = TILE_SIZE * sizeof(Body);
 
     // warmup
-    kernelFuerzas<<<grid,TILE_SIZE,shMem>>>(dPos,dAcc,N);
+    kernelFuerzas<<<grid,TILE_SIZE,shMem>>>(dPos,dAcc,0,N);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     cudaEvent_t evStart, evStop;
     cudaEventCreate(&evStart); cudaEventCreate(&evStop);
     cudaEventRecord(evStart);
-    kernelFuerzas<<<grid,TILE_SIZE,shMem>>>(dPos,dAcc,N);
+    kernelFuerzas<<<grid,TILE_SIZE,shMem>>>(dPos,dAcc,0,N);
     cudaEventRecord(evStop);
     cudaEventSynchronize(evStop);
     float gpuMs=0;
@@ -1852,9 +1816,31 @@ int main(int argc, char** argv)
     Body *hPos = NULL, *hVel = NULL;
     int nCargados = loadUniverse(g_ciPath, &hPos, &hVel);
     if (!nCargados) { glfwTerminate(); return 1; }
-    N = nCargados;
+
+    // El buffer guarda DOS poblaciones seguidas:
+    //   [0, nUni)          la telarana cosmica (del archivo)
+    //   [nUni, nUni+nGal)  la galaxia, con particulas PROPIAS
+    // Asi la telarana nunca se toca (nada de agujeros ni de convertir materia
+    // oscura en estrellas) y la fisica solo corre sobre la poblacion viva.
+    g_app.nUni = nCargados;
+    g_app.nGal = N_GALAXIA;
+    N = g_app.nUni + g_app.nGal;
     g_app.N = N;
+    g_app.bhIdx = g_app.nUni;      // initGalaxy pone el agujero en su indice 0
     size_t bytes = (size_t)N * sizeof(Body);
+
+    // Ampliamos los arrays del host para las dos poblaciones
+    hPos = (Body*)realloc(hPos, bytes);
+    hVel = (Body*)realloc(hVel, bytes);
+    if (!hPos || !hVel) { fprintf(stderr, "sin memoria\n"); glfwTerminate(); return 1; }
+
+    // La galaxia empieza DORMIDA: masa 0 -> el leapfrog la salta y el render la
+    // esconde. Despierta cuando la camara llega al halo.
+    for (int i = g_app.nUni; i < N; i++) {
+        hPos[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        hVel[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    printf("Particulas: %d telarana + %d galaxia = %d\n", g_app.nUni, g_app.nGal, N);
 
     // Activamos la fisica del universo: caja periodica y gravedad difusa
     // (sin agujero negro dominante). Estos simbolos los lee el kernel.
@@ -1884,12 +1870,7 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaMalloc(&dPosOrigen, bytes));
     CUDA_CHECK(cudaMalloc(&dPosDestino, bytes));
     CUDA_CHECK(cudaMalloc(&dVelDestino, bytes));   // velocidades orbitales de la galaxia
-    // slot[i]: hueco de la galaxia que ocupara la particula i (-1 = se queda
-    // como telarana cosmica). dContador cuenta cuantas caen en el halo.
-    int *dSlot, *dContador, *dBhIdx;
-    CUDA_CHECK(cudaMalloc(&dSlot, (size_t)N * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dContador, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dBhIdx, sizeof(int)));
+
 
     // ── VBO compartido CUDA-OpenGL ─────────────────────────────────────────
     // El VBO vive en la VRAM de la GPU.
@@ -2242,45 +2223,63 @@ int main(int argc, char** argv)
                 g_app.acto = ACTO_ZOOM;
             }
             else if (g_app.acto == ACTO_ZOOM) {
-                // ── ACTO 2 -> 3: el halo EMPIEZA a reorganizarse en galaxia ──
-                // No sustituimos de golpe: preparamos el destino y dejamos que
-                // kernelMorph lleve cada particula suavemente hasta su sitio.
+                // ── ACTO 2 -> 3: la galaxia empieza a formarse en el halo ──
+                //
+                // La galaxia trae sus PROPIAS particulas. Antes se reconvertian
+                // las de la telarana, lo que abria un hueco esferico en el
+                // universo y, peor, convertia materia oscura en estrellas: la
+                // materia oscura no radia, no se enfria, no puede formar disco.
+                // Ahora es una resimulacion de zoom de verdad: se re-puebla la
+                // region con particulas nuevas y la telarana queda intacta.
                 printf("\n[ACTO 3] El halo colapsa y forma la galaxia...\n");
 
-                // 1. Que particulas estan dentro del halo -> esas seran la galaxia.
-                //    Las de fuera se quedan quietas: la telarana cosmica sigue ahi.
-                CUDA_CHECK(cudaMemset(dContador, 0, sizeof(int)));
-                kernelMarcarHalo<<<gridSim, TILE_SIZE>>>(dPos, N, g_app.haloX,
-                                                         g_app.haloY, g_app.haloZ,
-                                                         dSlot, dContador, dBhIdx);
-                CUDA_CHECK(cudaMemcpy(&g_app.nGal, dContador, sizeof(int), cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(&g_app.bhIdx, dBhIdx, sizeof(int), cudaMemcpyDeviceToHost));
-                printf("         Materia dentro del halo (r=%.0f): %d particulas\n",
-                       RADIO_HALO, g_app.nGal);
-                printf("         El resto (%d) sigue siendo telarana cosmica\n", N - g_app.nGal);
-
-                // 2. Generamos una galaxia con EXACTAMENTE esas particulas
-                if (g_app.nGal > 1024) {
-                    initGalaxy(hPos, hVel, g_app.nGal);
-                    for (int i = 0; i < g_app.nGal; i++) {   // centrar en el halo
-                        hPos[i].x += g_app.haloX;
-                        hPos[i].y += g_app.haloY;
-                        hPos[i].z += g_app.haloZ;
-                    }
-                    CUDA_CHECK(cudaMemcpy(dPosOrigen,  dPos, bytes, cudaMemcpyDeviceToDevice));
-                    CUDA_CHECK(cudaMemcpy(dPosDestino, hPos,
-                                          (size_t)g_app.nGal * sizeof(Body),
-                                          cudaMemcpyHostToDevice));
-                    // Las velocidades ORBITALES que calculo initGalaxy. Sin
-                    // ellas la galaxia no rota y se deshace (bug historico).
-                    CUDA_CHECK(cudaMemcpy(dVelDestino, hVel,
-                                          (size_t)g_app.nGal * sizeof(Body),
-                                          cudaMemcpyHostToDevice));
-                    g_app.morphT = 0.0f;
-                    g_app.acto = ACTO_MORPH;
-                } else {
-                    printf("         AVISO: halo demasiado pobre, no se forma galaxia.\n");
+                // 1. La galaxia, en su propio rango del buffer
+                initGalaxy(hPos + g_app.nUni, hVel + g_app.nUni, g_app.nGal);
+                for (int i = 0; i < g_app.nGal; i++) {          // centrarla en el halo
+                    hPos[g_app.nUni + i].x += g_app.haloX;
+                    hPos[g_app.nUni + i].y += g_app.haloY;
+                    hPos[g_app.nUni + i].z += g_app.haloZ;
                 }
+                CUDA_CHECK(cudaMemcpy(dPosDestino, hPos + g_app.nUni,
+                                      (size_t)g_app.nGal * sizeof(Body),
+                                      cudaMemcpyHostToDevice));
+                // Las velocidades ORBITALES que calculo initGalaxy. Sin ellas
+                // la galaxia no rota y se deshace (bug historico).
+                CUDA_CHECK(cudaMemcpy(dVelDestino, hVel + g_app.nUni,
+                                      (size_t)g_app.nGal * sizeof(Body),
+                                      cudaMemcpyHostToDevice));
+
+                // 2. De donde sale: repartidas por el halo, como la materia
+                //    difusa antes de caer. Asi la galaxia se ve FORMARSE.
+                {
+                    Body* hOri = (Body*)malloc((size_t)g_app.nGal * sizeof(Body));
+                    for (int i = 0; i < g_app.nGal; i++) {
+                        float u  = powf(randf(), 0.40f) * RADIO_HALO;  // concentrado al centro
+                        float th = randf() * 2.0f * 3.14159265f;
+                        float ph = acosf(2.0f * randf() - 1.0f);
+                        hOri[i] = make_float4(g_app.haloX + u * sinf(ph) * cosf(th),
+                                              g_app.haloY + u * cosf(ph),
+                                              g_app.haloZ + u * sinf(ph) * sinf(th),
+                                              0.0f);      // masa 0: aun dormida
+                    }
+                    CUDA_CHECK(cudaMemcpy(dPosOrigen, hOri,
+                                          (size_t)g_app.nGal * sizeof(Body),
+                                          cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaMemcpy(dPos + g_app.nUni, hOri,
+                                          (size_t)g_app.nGal * sizeof(Body),
+                                          cudaMemcpyHostToDevice));
+                    free(hOri);
+                }
+
+                // 3. Congelar la telarana: pasa a ser decorado, sin gravedad
+                kernelCongelarTelarana<<<(g_app.nUni + TILE_SIZE - 1) / TILE_SIZE,
+                                         TILE_SIZE>>>(dPos, dVel, g_app.nUni);
+
+                printf("         Galaxia: %d particulas propias | telarana: %d intacta\n",
+                       g_app.nGal, g_app.nUni);
+
+                g_app.morphT = 0.0f;
+                g_app.acto = ACTO_MORPH;
             }
         }
 
@@ -2347,14 +2346,17 @@ int main(int argc, char** argv)
             g_app.morphT += dt / SEG_MORPH;
             float s = fminf(1.0f, g_app.morphT);
 
-            kernelMorph<<<gridSim, TILE_SIZE>>>(dPos, dPosOrigen, dPosDestino, dSlot,
-                                                N, g_app.nGal, s,
+            // Puntero desplazado: el kernel solo ve la galaxia (nUni..N)
+            int gridGal = (g_app.nGal + TILE_SIZE - 1) / TILE_SIZE;
+            kernelMorph<<<gridGal, TILE_SIZE>>>(dPos + g_app.nUni, dPosOrigen, dPosDestino,
+                                                g_app.nGal, s,
                                                 g_app.haloX, g_app.haloY, g_app.haloZ);
 
             if (g_app.morphT >= 1.0f) {
                 // Cada estrella recibe su velocidad orbital -> la galaxia rota
-                kernelAsignarVelGalaxia<<<gridSim, TILE_SIZE>>>(dPos, dVel, dVelDestino,
-                                                                dSlot, N, g_app.nGal);
+                kernelAsignarVelGalaxia<<<(g_app.nGal + TILE_SIZE - 1) / TILE_SIZE,
+                                          TILE_SIZE>>>(dVel + g_app.nUni, dVelDestino,
+                                                       g_app.nGal);
                 // Ya esta formada: activamos la fisica de la galaxia
                 bool  per  = false;          // la galaxia no vive en caja periodica
                 float gG   = G;
@@ -2371,12 +2373,19 @@ int main(int argc, char** argv)
         // ── Paso de fisica en GPU ─────────────────────────────────────────
         if (!g_app.paused && g_app.acto != ACTO_MORPH) {
             // 1. Calcular fuerzas (O(N^2) con tiling)
-            kernelFuerzas<<<gridSim, TILE_SIZE, shMem>>>(dPos, dAcc, N);
+            // Solo el conjunto ACTIVO: la telarana (0..nUni) mientras el
+            // universo evoluciona; la galaxia (nUni..N) despues. Asi el O(N^2)
+            // no gasta tiempo en las particulas congeladas.
+            int actInicio = (g_app.acto == ACTO_GALAXIA) ? g_app.nUni : 0;
+            int actCuantas = (g_app.acto == ACTO_GALAXIA) ? g_app.nGal : g_app.nUni;
+            int gridAct = (actCuantas + TILE_SIZE - 1) / TILE_SIZE;
+            kernelFuerzas<<<gridAct, TILE_SIZE, shMem>>>(dPos, dAcc, actInicio, actCuantas);
 
             // 2. Integrar (Leapfrog). En modo universo la caja se envuelve.
             // El universo evoluciona con pasos mas largos que la galaxia
             float dtSim = (g_app.acto == ACTO_GALAXIA) ? DT : DT_UNIVERSE;
-            kernelLeapfrog<<<gridSim, TILE_SIZE>>>(dPos, dVel, dAcc, N, dtSim);
+            kernelLeapfrog<<<gridAct, TILE_SIZE>>>(dPos + actInicio, dVel + actInicio,
+                                                  dAcc + actInicio, actCuantas, dtSim);
 
             // En el UNIVERSO no hay agujero negro: la estructura emerge sola de
             // las fluctuaciones. Pero en la GALAXIA hay que recolocar el
@@ -2384,8 +2393,9 @@ int main(int argc, char** argv)
             // deriva visiblemente respecto de las estrellas.
             if (g_app.acto == ACTO_GALAXIA) {
                 CUDA_CHECK(cudaMemset(dCoM, 0, 4 * sizeof(float)));
-                kernelAcumCoM<<<gridSim, TILE_SIZE>>>(dPos, N, dCoM, g_app.bhIdx, dSlot);
-                kernelFijarBHalCoM<<<1, 1>>>(dPos, dCoM, g_app.bhIdx);
+                int gGal = (g_app.nGal + TILE_SIZE - 1) / TILE_SIZE;
+                kernelAcumCoM<<<gGal, TILE_SIZE>>>(dPos + g_app.nUni, g_app.nGal, dCoM, 0);
+                kernelFijarBHalCoM<<<1, 1>>>(dPos + g_app.nUni, dCoM, 0);
                 // Se traga lo que se acerca demasiado. El radio (0.42) es el
                 // del DISCO DE ACRECION, no el del horizonte (0.085): antes
                 // absorbia solo dentro del horizonte y las estrellas que
@@ -2396,8 +2406,8 @@ int main(int argc, char** argv)
                 // MAREA mucho antes de cruzar el horizonte, y sus restos
                 // alimentan el disco. No necesita llegar al horizonte para
                 // desaparecer.
-                kernelAbsorber<<<gridSim, TILE_SIZE>>>(dPos, dVel, N, g_app.bhIdx,
-                                                       RADIO_BH * 0.42f);
+                kernelAbsorber<<<gGal, TILE_SIZE>>>(dPos + g_app.nUni, dVel + g_app.nUni,
+                                                    g_app.nGal, 0, RADIO_BH * 0.42f);
             }
 
             g_app.steps++;
@@ -2421,13 +2431,10 @@ int main(int argc, char** argv)
         CUDA_CHECK(cudaGraphicsResourceGetMappedPointer(
                        (void**)&devVBOPtr, &vboSize, cudaVBORes));
 
-        // En el ACTO 1 no hay slots todavia -> se pasa NULL y no se atenua nada.
-        // Al formarse la galaxia la telarana baja a un 18% de su brillo.
+        // Al formarse la galaxia la telarana baja al 18% de su brillo.
         {
-            const int* slotRender = (g_app.acto == ACTO_UNIVERSO || g_app.acto == ACTO_ZOOM)
-                                    ? NULL : dSlot;
             float aten = 1.0f - 0.82f * fadeDeco;
-            kernelCopiaVBO<<<gridCopy, 256>>>(dPos, devVBOPtr, N, slotRender, aten);
+            kernelCopiaVBO<<<gridCopy, 256>>>(dPos, devVBOPtr, N, g_app.nUni, aten);
         }
 
         CUDA_CHECK(cudaGraphicsUnmapResources(1, &cudaVBORes, 0));
