@@ -2168,7 +2168,6 @@ int main(int argc, char** argv)
     GLint  locCompBloom   = glGetUniformLocation(compProg, "uBloom");
 
     // ── Configuracion de kernels ───────────────────────────────────────────
-    int gridSim  = (N + TILE_SIZE - 1) / TILE_SIZE;
     int gridCopy = (N + 255) / 256;
     size_t shMem = TILE_SIZE * sizeof(Body);
 
@@ -2211,7 +2210,11 @@ int main(int argc, char** argv)
 
             if (g_app.acto == ACTO_UNIVERSO) {
                 // ── ACTO 1 -> 2: buscar el halo mas denso y empezar el zoom ──
-                g_app.haloPop = buscarHalo(dPos, N, &g_app.haloX, &g_app.haloY, &g_app.haloZ);
+                // Solo la telarana (0..nUni). Si le pasamos N cuenta tambien las
+                // 60k particulas de la galaxia, que duermen apiladas en (0,0,0):
+                // esa celda gana siempre y el "halo" sale en la esquina de la caja.
+                g_app.haloPop = buscarHalo(dPos, g_app.nUni,
+                                           &g_app.haloX, &g_app.haloY, &g_app.haloZ);
                 printf("\n[ACTO 2] Halo mas denso: (%.1f, %.1f, %.1f) con %d particulas\n",
                        g_app.haloX, g_app.haloY, g_app.haloZ, g_app.haloPop);
                 printf("         Volando hasta el...\n");
