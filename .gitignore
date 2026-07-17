@@ -15,8 +15,13 @@ galaxy.*
 # --- Presentaciones HTML (no son código del proyecto) ---
 *.html
 
-# --- Documentos de contexto / instrucciones (se quedan locales) ---
+# --- Documentos de contexto / instrucciones / presentacion (se quedan locales) ---
 CONTEXTO_PROYECTO.md
+GUIA_TECNICA.md
+REPARTO_EXPOSICION.md
+FUENTE_NOTEBOOKLM.md
+PROMPT_PARA_FELIPE.md
+PROMPT_PC3.md
 INSTRUCCIONES_PC1_MAESTRO.md
 INSTRUCCIONES_PC2_TRABAJADOR.md
 INSTRUCCIONES_PC3_TRABAJADOR.md
