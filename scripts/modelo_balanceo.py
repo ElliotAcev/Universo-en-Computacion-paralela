@@ -26,17 +26,23 @@ from simular_universo import aceleraciones, BOX
 
 # Velocidad relativa de cada GPU (1.0 = la más rápida).
 #
-# MEDIDAS REALES en el clúster (2026-07-16, N=1500, steps=200, backend CUDA):
-#   RTX 4060: 0.43 s/universo  -> 1.00 (referencia)
-#   RTX 3050: 0.66 s/universo  -> 0.65
-# Validado en hardware real: con reparto 10/10 el speedup fue 1.65x; aplicando
-# estos pesos (reparto 12/8) subio a 1.96x -> 98% de eficiencia paralela.
+# TODAS MEDIDAS en el cluster real de 3 PCs (N=3000, steps=300, 120 universos):
+#   RTX 4060 (CUDA)  : 0.215 s/universo -> 4.65 universos/s -> 1.000
+#   RTX 3050 (CUDA)  : 0.245 s/universo -> 4.08 universos/s -> 0.877
+#   AMD gfx1032 (OpenCL): 0.340 s/universo -> 2.94 universos/s -> 0.632
 #
-# El peso de la AMD sigue siendo una ESTIMACION (aun no se ha medido).
+# VALIDADO en hardware real con las 3 GPUs:
+#   reparto ingenuo  40/40/40 -> 13.6 s, speedup 2.36x, eficiencia 78.7%
+#   reparto aprendido 47/42/31 -> 10.5 s, speedup 2.94x, eficiencia 98.0%
+#   => -22.8% de tiempo, +24.6% de speedup, tiempo ocioso de 5.0s a 0.4s
+#
+# OJO: los pesos DEPENDEN DE N. A N=1500 la AMD era la mas rapida del cluster;
+# a N=3000 es la mas lenta, porque el kernel CUDA tiene shared-memory tiling y
+# el de OpenCL todavia no. Hay que medir a la N de trabajo, no extrapolar.
 GPUS = {
-    "PC1-RTX4060 (CUDA)": 1.00,    # medido
-    "PC2-RTX3050 (CUDA)": 0.65,    # medido
-    "PC3-AMD-RX (OpenCL)": 0.40,   # estimado, pendiente de medir
+    "PC1-RTX4060 (CUDA)": 1.000,    # medido
+    "PC2-RTX3050 (CUDA)": 0.877,    # medido
+    "PC3-AMD-RX (OpenCL)": 0.632,   # medido
 }
 
 
