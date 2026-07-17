@@ -32,6 +32,8 @@ __pycache__/
 dataset/
 *.npz
 *.pt
+# condiciones iniciales de la app CUDA (las regenera exportar_ci.py)
+*.bin
 
 # --- Scratchpad / temporales ---
 scratchpad/
