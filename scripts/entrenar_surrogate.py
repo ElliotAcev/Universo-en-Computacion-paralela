@@ -39,14 +39,20 @@ def densidad(pos, G):
 
 
 def cargar_dataset(carpeta, G):
-    X, Y = [], []
+    """Devuelve (X, Y, t_sim): rejillas inicial y final, y el tiempo REAL que
+    costo simular cada universo (viene guardado en el .npz). Ese tiempo es con
+    el que hay que comparar el surrogate, no una constante inventada."""
+    X, Y, tiempos = [], [], []
     for archivo in sorted(glob.glob(f"{carpeta}/universo_seed*.npz")):
         d = np.load(archivo)
         X.append(densidad(d["pos_inicial"], G))
         Y.append(densidad(d["pos_final"], G))
+        if "tiempo_s" in d:
+            tiempos.append(float(d["tiempo_s"]))
     X = np.array(X)[:, None, :, :, :]   # (muestras, 1, G, G, G)
     Y = np.array(Y)[:, None, :, :, :]
-    return torch.tensor(X), torch.tensor(Y)
+    t_sim = float(np.mean(tiempos)) if tiempos else None
+    return torch.tensor(X), torch.tensor(Y), t_sim
 
 
 class SurrogateCNN(nn.Module):
@@ -75,8 +81,10 @@ def main():
     args = ap.parse_args()
 
     print(f"Dispositivo: {DISPOSITIVO}")
-    X, Y = cargar_dataset(args.carpeta, args.grid)
+    X, Y, t_sim = cargar_dataset(args.carpeta, args.grid)
     print(f"Universos cargados: {len(X)}  (rejilla {args.grid}^3)")
+    if t_sim:
+        print(f"Tiempo real de simular uno: {t_sim*1000:.0f} ms (medido, guardado en los .npz)")
     if len(X) < 6:
         print("Pocos universos. Genera mas con generar_universos.py")
         return
@@ -136,9 +144,15 @@ def main():
         if DISPOSITIVO == "cuda":
             torch.cuda.synchronize()
         t_inf = (time.perf_counter() - t0) / 50
+    # Comparamos contra el tiempo REAL medido al generar el dataset, no contra
+    # una constante. Si la simulacion se acelera (GPU, mejor kernel), la ventaja
+    # del surrogate baja -> hay que reportarlo con honestidad, no inflarlo.
     print(f"\n  Inferencia del surrogate : {t_inf*1000:.2f} ms por universo")
-    print(f"  Simulacion real (aprox.) : ~16000 ms por universo")
-    print(f"  ACELERACION: ~{16.0/t_inf:.0f}x mas rapido (surrogate vs simular)")
+    if t_sim:
+        print(f"  Simulacion real (MEDIDA) : {t_sim*1000:.0f} ms por universo")
+        print(f"  ACELERACION: ~{t_sim/t_inf:.0f}x mas rapido (surrogate vs simular)")
+    else:
+        print("  (los .npz no traen tiempo_s: no se puede comparar la velocidad)")
 
     torch.save(modelo.state_dict(), args.salida)
     print(f"\n  Modelo guardado en: {args.salida}")
