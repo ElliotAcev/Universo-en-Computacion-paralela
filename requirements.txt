@@ -8,6 +8,11 @@ matplotlib
 # NO se instalan desde aqui: cada uno necesita su propio comando.
 #
 # GPU NVIDIA (CUDA) -- PC1 (RTX 4060), PC2 (RTX 3050):
+#   pip install cupy-cuda12x
+#   (CuPy compila el kernel N-body propio; es 3x mas rapido que hacerlo con
+#    tensores de PyTorch, que construye arrays NxN en memoria)
+#
+# Solo el MAESTRO necesita ademas PyTorch, para entrenar el surrogate:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu121
 #
 # GPU AMD (OpenCL) -- PC3 (Radeon RX):
