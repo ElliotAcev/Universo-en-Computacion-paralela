@@ -14,22 +14,26 @@ import numpy as np
 # aplicando imagen minima para respetar la caja periodica.
 KERNEL = """
 __kernel void aceleraciones(
-    __global const float *pos,    // N*3 (x,y,z por particula)
+    __global const float *pos,    // N*3 (x,y,z de TODAS las particulas)
     __global const float *masa,   // N
-    __global float *acc,          // N*3 (salida)
-    const int n,
+    __global float *acc,          // cuantas*3 (salida, solo el trozo local)
+    const int n,                  // total de particulas del universo
+    const int inicio,             // primera particula de este nodo
+    const int cuantas,            // cuantas le tocan a este nodo
     const float box,
     const float eps2,
     const float g)
 {
+    // i = indice LOCAL (dentro del trozo);  ig = indice GLOBAL en el universo
     int i = get_global_id(0);
-    if (i >= n) return;
+    if (i >= cuantas) return;
+    int ig = inicio + i;
 
-    float xi = pos[i*3+0], yi = pos[i*3+1], zi = pos[i*3+2];
+    float xi = pos[ig*3+0], yi = pos[ig*3+1], zi = pos[ig*3+2];
     float ax = 0.0f, ay = 0.0f, az = 0.0f;
 
     for (int j = 0; j < n; j++) {
-        if (j == i) continue;                 // nadie se atrae a si mismo
+        if (j == ig) continue;                // nadie se atrae a si mismo
 
         float dx = pos[j*3+0] - xi;
         float dy = pos[j*3+1] - yi;
@@ -82,19 +86,24 @@ class OpenCLBackend:
         self.kernel = cl.Kernel(self.programa, "aceleraciones")
 
     def aceleraciones(self, pos, masa):
+        return self.aceleraciones_rango(pos, masa, 0, len(masa))
+
+    def aceleraciones_rango(self, pos, masa, inicio, cuantas):
+        """Acelera solo [inicio, inicio+cuantas) contra TODAS (modo distribuido)."""
         cl = self.cl
         n = np.int32(len(masa))
         pos32 = np.ascontiguousarray(pos, dtype=np.float32).ravel()
         masa32 = np.ascontiguousarray(masa, dtype=np.float32)
-        acc32 = np.empty_like(pos32)
+        acc32 = np.empty(int(cuantas) * 3, dtype=np.float32)
 
         mf = cl.mem_flags
         b_pos = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pos32)
         b_masa = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=masa32)
         b_acc = cl.Buffer(self.ctx, mf.WRITE_ONLY, acc32.nbytes)
 
-        self.kernel(self.cola, (int(n),), None,
-                    b_pos, b_masa, b_acc, n, self.box, self.eps2, self.G)
+        self.kernel(self.cola, (int(cuantas),), None,
+                    b_pos, b_masa, b_acc, n, np.int32(inicio), np.int32(cuantas),
+                    self.box, self.eps2, self.G)
         cl.enqueue_copy(self.cola, acc32, b_acc)
         self.cola.finish()
 

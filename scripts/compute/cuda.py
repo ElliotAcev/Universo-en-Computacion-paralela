@@ -22,16 +22,21 @@ TILE = 256
 
 KERNEL = r'''
 extern "C" __global__ void aceleraciones(
-    const float* __restrict__ pos,    // N*3 (x,y,z por particula)
+    const float* __restrict__ pos,    // N*3 (x,y,z de TODAS las particulas)
     const float* __restrict__ masa,   // N
-    float* __restrict__ acc,          // N*3 (salida)
-    const int n, const float box, const float eps2, const float g)
+    float* __restrict__ acc,          // cuantas*3 (salida, solo el trozo local)
+    const int n,                      // total de particulas del universo
+    const int inicio,                 // primera particula de este nodo
+    const int cuantas,                // cuantas le tocan a este nodo
+    const float box, const float eps2, const float g)
 {
     extern __shared__ float4 tile[];
 
+    // i = indice LOCAL (dentro del trozo);  ig = indice GLOBAL en el universo
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int ig = inicio + i;
     float xi = 0.0f, yi = 0.0f, zi = 0.0f;
-    if (i < n) { xi = pos[i*3+0]; yi = pos[i*3+1]; zi = pos[i*3+2]; }
+    if (i < cuantas) { xi = pos[ig*3+0]; yi = pos[ig*3+1]; zi = pos[ig*3+2]; }
 
     float ax = 0.0f, ay = 0.0f, az = 0.0f;
 
@@ -46,7 +51,7 @@ extern "C" __global__ void aceleraciones(
         // Todo el bloque reusa esos cuerpos desde shared memory
         for (int k = 0; k < blockDim.x; k++) {
             int jg = t * blockDim.x + k;
-            if (jg >= n || jg == i) continue;
+            if (jg >= n || jg == ig) continue;
 
             float dx = tile[k].x - xi;
             float dy = tile[k].y - yi;
@@ -67,7 +72,7 @@ extern "C" __global__ void aceleraciones(
         __syncthreads();
     }
 
-    if (i < n) { acc[i*3+0] = ax; acc[i*3+1] = ay; acc[i*3+2] = az; }
+    if (i < cuantas) { acc[i*3+0] = ax; acc[i*3+1] = ay; acc[i*3+2] = az; }
 }
 '''
 
@@ -94,16 +99,21 @@ class CUDABackend:
         _ = int(cp.zeros(8, dtype=cp.float32).sum())
 
     def aceleraciones(self, pos, masa):
+        return self.aceleraciones_rango(pos, masa, 0, len(masa))
+
+    def aceleraciones_rango(self, pos, masa, inicio, cuantas):
+        """Acelera solo [inicio, inicio+cuantas) contra TODAS (modo distribuido)."""
         cp = self.cp
         n = np.int32(len(masa))
         d_pos = cp.asarray(np.ascontiguousarray(pos, dtype=np.float32).ravel())
         d_masa = cp.asarray(np.ascontiguousarray(masa, dtype=np.float32))
-        d_acc = cp.empty_like(d_pos)
+        d_acc = cp.empty(int(cuantas) * 3, dtype=cp.float32)
 
-        bloques = (int(n) + TILE - 1) // TILE
+        bloques = (int(cuantas) + TILE - 1) // TILE
         shmem = TILE * 16          # TILE * sizeof(float4)
         self.kernel((bloques,), (TILE,),
-                    (d_pos, d_masa, d_acc, n, self.box, self.eps2, self.G),
+                    (d_pos, d_masa, d_acc, n, np.int32(inicio), np.int32(cuantas),
+                     self.box, self.eps2, self.G),
                     shared_mem=shmem)
 
         return cp.asnumpy(d_acc).reshape(-1, 3).astype(np.float64)
