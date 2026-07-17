@@ -84,6 +84,15 @@ RANKS = ["PC1 · RTX 4060", "PC2 · RTX 3050", "PC3 · AMD RX 6600 XT"]
 # y apilarlos en un grafico enganaria. Por rank si cuadra: calculo + red = total.
 MODO_B = [
     {
+        # La referencia: mismo codigo, mismo N, pero SIN red. Los 3 procesos
+        # comparten la 4060 de PC1, asi que no hay 3 GPUs de verdad — es la
+        # medida de "cuanto costaria esto sin salir de casa".
+        #   mpiexec -n 3 python scripts/nbody_distribuido.py --n 150000 --steps 20 --backend auto
+        "etiqueta": "N=148.877\n(local, 1 PC)",
+        "n": 148877, "pasos": 20, "datos_mb_paso": 3.6, "local": True,
+        "ranks": [(7.29, 0.08, 7.36), (7.33, 0.03, 7.36), (7.34, 0.02, 7.36)],
+    },
+    {
         "etiqueta": "N=19.683\n(relay DERP)",
         "n": 19683, "pasos": 50, "datos_mb_paso": 0.5,
         # rank: (calculo_s, red_s, total_s)
@@ -100,6 +109,21 @@ MODO_B = [
         "ranks": [(6.06, 50.18, 56.25), (7.12, 49.02, 56.24), (2.24, 53.79, 56.25)],
     },
 ]
+
+def modo_b_penalizacion():
+    """Cuanto mas lento sale repartir por internet que hacerlo en un solo PC.
+
+    Comparables: mismo N (148.877), mismos 20 pasos, mismo codigo."""
+    local = next(e for e in MODO_B if e.get("local"))
+    t_local = max(r[2] for r in local["ranks"])
+    out = []
+    for e in MODO_B:
+        if e.get("local") or e["n"] != local["n"]:
+            continue
+        t = max(r[2] for r in e["ranks"])
+        out.append((e["etiqueta"], t, t / t_local))
+    return t_local, out
+
 
 # La conclusion, con numeros:
 #   - La conexion directa (49 ms de latencia, sin relay) solo mejoro un 14%.
